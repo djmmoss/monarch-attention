@@ -20,15 +20,15 @@ def optimal_block_size(seq_len: int) -> int:
     """Pick the nearest power-of-2 block size to sqrt(seq_len).
 
     This balances the B×B (within-block) and M×M (across-block) attention
-    costs. Clamped to [16, 128] — below 16 Triton kernels don't work,
-    above 128 the within-block B×B attention becomes too large for the
-    non-tiled kernel path (and B=512 hits Triton compiler limits).
+    costs. Clamped to [16, 512] — below 16 Triton kernels don't work.
+    For B > 128, tiled within-block kernels with online softmax are used
+    automatically to avoid materializing the full B×B attention matrix.
     """
     sqrt_n = math.sqrt(seq_len)
     low = 2 ** int(math.log2(sqrt_n))
     high = low * 2
     best = low if abs(sqrt_n - low) <= abs(sqrt_n - high) else high
-    return max(min(best, 128), 16)
+    return max(min(best, 512), 16)
 
 
 class PadType(StrEnum):

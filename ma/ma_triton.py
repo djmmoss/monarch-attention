@@ -168,6 +168,159 @@ def _al_cl_kernel(
 
 
 @triton.jit
+def _al_cl_kernel_tiled(
+    ar_ptr,
+    stride_ar_e,
+    stride_ar_h,
+    stride_ar_m,
+    stride_ar_b,
+    stride_ar_d,
+    k_ptr,
+    stride_k_e,
+    stride_k_h,
+    stride_k_m,
+    stride_k_b,
+    stride_k_d,
+    cr_ptr,
+    stride_cr_e,
+    stride_cr_h,
+    stride_cr_m,
+    stride_cr_b,
+    al_ptr,
+    stride_al_e,
+    stride_al_h,
+    stride_al_m,
+    stride_al_b,
+    stride_al_d,
+    cl_ptr,
+    stride_cl_e,
+    stride_cl_h,
+    stride_cl_m,
+    stride_cl_b,
+    mask_ptr,
+    stride_mask_e,
+    stride_mask_m,
+    stride_mask_b,
+    sm_scale: float,
+    HAS_ATTN_MASK: tl.constexpr,
+    TILE_B: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    PRE_PAD: tl.constexpr,
+    EPS: tl.constexpr,
+    IS_FIRST_CALL: tl.constexpr,
+    H: tl.constexpr,
+    M: tl.constexpr,
+    B: tl.constexpr,
+    D: tl.constexpr,
+    N: tl.constexpr,
+):
+    """Tiled version of _al_cl_kernel for large B (>128).
+
+    Uses online softmax to tile over key positions, avoiding B×B attention matrices.
+    Grid: (E*H, M, cdiv(B, TILE_B))
+    """
+    idx_eh = tl.program_id(0)
+    idx_m = tl.program_id(1)
+    idx_q_tile = tl.program_id(2)
+    idx_e = idx_eh // H
+    idx_h = idx_eh % H
+
+    pad_offset = M * B - N if PRE_PAD else 0
+    block_start_n = B * idx_m
+
+    # Query tile range
+    q_start = idx_q_tile * TILE_B
+    range_q = q_start + tl.arange(0, TILE_B)
+    range_d = tl.arange(0, BLOCK_D)
+    mask_q = range_q < B
+    mask_d = range_d < D
+
+    # Load ar (query rows for this tile)
+    ar_base = ar_ptr + stride_ar_e * idx_e + stride_ar_h * idx_h + stride_ar_m * idx_m
+    if IS_FIRST_CALL:
+        ar_offset = stride_ar_b * (range_q - pad_offset)[:, None] + range_d[None, :]
+        if PRE_PAD:
+            q_load_mask = mask_q & ((block_start_n + range_q) >= pad_offset)
+        else:
+            q_load_mask = mask_q & ((block_start_n + range_q) < N)
+        ar = tl.load(ar_base + ar_offset, mask=q_load_mask[:, None] & mask_d[None, :], other=0.0)
+    else:
+        ar_offset = stride_ar_b * range_q[:, None] + range_d[None, :]
+        ar = tl.load(ar_base + ar_offset, mask=mask_q[:, None] & mask_d[None, :], other=0.0)
+    ar_bf16 = ar.to(tl.bfloat16)
+
+    # Load cr for query tile
+    cr_base = cr_ptr + stride_cr_e * idx_e + stride_cr_h * idx_h + stride_cr_m * idx_m
+    cr = tl.load(cr_base + stride_cr_b * range_q, mask=mask_q, other=1.0)
+
+    # Online softmax accumulators
+    max_rows = tl.full([TILE_B], float('-inf'), dtype=tl.float32)
+    sum_rows = tl.zeros([TILE_B], dtype=tl.float32)
+    al_acc = tl.zeros([TILE_B, BLOCK_D], dtype=tl.float32)
+    score_acc = tl.zeros([TILE_B], dtype=tl.float32)
+
+    # Loop over key tiles
+    k_base = k_ptr + stride_k_e * idx_e + stride_k_h * idx_h + stride_k_m * idx_m
+    range_k = tl.arange(0, TILE_B)
+
+    for k_start in tl.range(0, B, TILE_B):
+        k_range = k_start + range_k
+        k_mask = k_range < B
+        if PRE_PAD:
+            k_valid = k_mask & ((block_start_n + k_range) >= pad_offset)
+        else:
+            k_valid = k_mask & ((block_start_n + k_range) < N)
+
+        if HAS_ATTN_MASK:
+            mask_block_ptr = (
+                mask_ptr + stride_mask_e * idx_e + stride_mask_m * idx_m
+                + stride_mask_b * (k_range - pad_offset)
+            )
+            valid_token_mask = tl.load(mask_block_ptr, mask=k_valid, other=0)
+            k_valid = k_valid & valid_token_mask
+
+        # Load key tile [TILE_B, D]
+        k_offset = stride_k_b * (k_range - pad_offset)[:, None] + range_d[None, :]
+        k_tile = tl.load(k_base + k_offset, mask=k_valid[:, None] & mask_d[None, :], other=0.0)
+        k_bf16 = k_tile.to(tl.bfloat16)
+
+        # Scores [TILE_B_q, TILE_B_k]
+        scores = sm_scale * tl.dot(ar_bf16, tl.trans(k_bf16), out_dtype=tl.float32)
+        scores = scores / (cr[:, None] + EPS)
+        scores = scores + tl.where(k_valid[None, :], 0.0, float("-inf"))
+
+        # Online softmax update
+        tile_max = tl.max(scores, axis=1)
+        new_max = tl.maximum(max_rows, tile_max)
+        scale = tl.exp(max_rows - new_max)
+
+        al_acc = al_acc * scale[:, None]
+        sum_rows = sum_rows * scale
+        score_acc = score_acc * scale
+
+        exp_scores = tl.exp(scores - new_max[:, None])
+        al_acc = al_acc + tl.dot(exp_scores.to(tl.bfloat16), k_bf16, out_dtype=tl.float32)
+        score_acc = score_acc + tl.sum(exp_scores * scores, axis=1)
+        sum_rows = sum_rows + tl.sum(exp_scores, axis=1)
+        max_rows = new_max
+
+    # Finalize: al = sm_scale * (sum_j exp(s-max) * k_j) / sum = sm_scale * r @ k
+    safe_sum = tl.where(sum_rows > 0, sum_rows, 1.0)
+    al = (sm_scale * al_acc / safe_sum[:, None]).to(ar.dtype)
+    # cl = sum_j(r_ij * log(r_ij)) = score_acc/sum - max - log(sum)
+    cl = tl.where(sum_rows > 0, score_acc / safe_sum - max_rows - tl.log(safe_sum), 0.0)
+
+    # Store al
+    al_base = al_ptr + stride_al_e * idx_e + stride_al_h * idx_h + stride_al_m * idx_m
+    al_offset = stride_al_b * range_q[:, None] + range_d[None, :]
+    tl.store(al_base + al_offset, al, mask=mask_q[:, None] & mask_d[None, :])
+
+    # Store cl
+    cl_base = cl_ptr + stride_cl_e * idx_e + stride_cl_h * idx_h + stride_cl_m * idx_m
+    tl.store(cl_base + stride_cl_b * range_q, cl, mask=mask_q)
+
+
+@triton.jit
 def _ar_cr_kernel(
     al_ptr,
     stride_al_e,
@@ -484,6 +637,176 @@ def _al_y_cl_kernel(
         y,
         mask=mask_b[:, None] & mask_d[None, :],
     )
+
+
+@triton.jit
+def _al_y_cl_kernel_tiled(
+    ar_ptr,
+    stride_ar_e,
+    stride_ar_h,
+    stride_ar_m,
+    stride_ar_b,
+    stride_ar_d,
+    k_ptr,
+    stride_k_e,
+    stride_k_h,
+    stride_k_m,
+    stride_k_b,
+    stride_k_d,
+    v_ptr,
+    stride_v_e,
+    stride_v_h,
+    stride_v_m,
+    stride_v_b,
+    stride_v_d,
+    cr_ptr,
+    stride_cr_e,
+    stride_cr_h,
+    stride_cr_m,
+    stride_cr_b,
+    al_ptr,
+    stride_al_e,
+    stride_al_h,
+    stride_al_m,
+    stride_al_b,
+    stride_al_d,
+    y_ptr,
+    stride_y_e,
+    stride_y_h,
+    stride_y_m,
+    stride_y_b,
+    stride_y_d,
+    cl_ptr,
+    stride_cl_e,
+    stride_cl_h,
+    stride_cl_m,
+    stride_cl_b,
+    mask_ptr,
+    stride_mask_e,
+    stride_mask_m,
+    stride_mask_b,
+    sm_scale: float,
+    HAS_ATTN_MASK: tl.constexpr,
+    TILE_B: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    PRE_PAD: tl.constexpr,
+    EPS: tl.constexpr,
+    H: tl.constexpr,
+    M: tl.constexpr,
+    B: tl.constexpr,
+    D: tl.constexpr,
+    N: tl.constexpr,
+):
+    """Tiled version of _al_y_cl_kernel for large B (>128).
+
+    Uses online softmax to tile over key positions, also accumulates y = r @ v.
+    Grid: (E*H, M, cdiv(B, TILE_B))
+    """
+    idx_eh = tl.program_id(0)
+    idx_m = tl.program_id(1)
+    idx_q_tile = tl.program_id(2)
+    idx_e = idx_eh // H
+    idx_h = idx_eh % H
+
+    pad_offset = M * B - N if PRE_PAD else 0
+    block_start_n = B * idx_m
+
+    # Query tile range
+    q_start = idx_q_tile * TILE_B
+    range_q = q_start + tl.arange(0, TILE_B)
+    range_d = tl.arange(0, BLOCK_D)
+    mask_q = range_q < B
+    mask_d = range_d < D
+
+    # Load ar (query rows for this tile) - always from ar tensor (not q)
+    ar_base = ar_ptr + stride_ar_e * idx_e + stride_ar_h * idx_h + stride_ar_m * idx_m
+    ar_offset = stride_ar_b * range_q[:, None] + range_d[None, :]
+    ar = tl.load(ar_base + ar_offset, mask=mask_q[:, None] & mask_d[None, :], other=0.0)
+    ar_bf16 = ar.to(tl.bfloat16)
+
+    # Load cr for query tile
+    cr_base = cr_ptr + stride_cr_e * idx_e + stride_cr_h * idx_h + stride_cr_m * idx_m
+    cr = tl.load(cr_base + stride_cr_b * range_q, mask=mask_q, other=1.0)
+
+    # Online softmax accumulators
+    max_rows = tl.full([TILE_B], float('-inf'), dtype=tl.float32)
+    sum_rows = tl.zeros([TILE_B], dtype=tl.float32)
+    al_acc = tl.zeros([TILE_B, BLOCK_D], dtype=tl.float32)
+    y_acc = tl.zeros([TILE_B, BLOCK_D], dtype=tl.float32)
+    score_acc = tl.zeros([TILE_B], dtype=tl.float32)
+
+    # Loop over key/value tiles
+    k_base = k_ptr + stride_k_e * idx_e + stride_k_h * idx_h + stride_k_m * idx_m
+    v_base = v_ptr + stride_v_e * idx_e + stride_v_h * idx_h + stride_v_m * idx_m
+    range_k = tl.arange(0, TILE_B)
+
+    for k_start in tl.range(0, B, TILE_B):
+        k_range = k_start + range_k
+        k_mask = k_range < B
+        if PRE_PAD:
+            k_valid = k_mask & ((block_start_n + k_range) >= pad_offset)
+        else:
+            k_valid = k_mask & ((block_start_n + k_range) < N)
+
+        if HAS_ATTN_MASK:
+            mask_block_ptr = (
+                mask_ptr + stride_mask_e * idx_e + stride_mask_m * idx_m
+                + stride_mask_b * (k_range - pad_offset)
+            )
+            valid_token_mask = tl.load(mask_block_ptr, mask=k_valid, other=0)
+            k_valid = k_valid & valid_token_mask
+
+        # Load key tile [TILE_B, D]
+        k_offset = stride_k_b * (k_range - pad_offset)[:, None] + range_d[None, :]
+        k_tile = tl.load(k_base + k_offset, mask=k_valid[:, None] & mask_d[None, :], other=0.0)
+        k_bf16 = k_tile.to(tl.bfloat16)
+
+        # Load value tile [TILE_B, D]
+        v_offset = stride_v_b * (k_range - pad_offset)[:, None] + range_d[None, :]
+        v_tile = tl.load(v_base + v_offset, mask=k_valid[:, None] & mask_d[None, :], other=0.0)
+        v_bf16 = v_tile.to(tl.bfloat16)
+
+        # Scores [TILE_B_q, TILE_B_k]
+        scores = sm_scale * tl.dot(ar_bf16, tl.trans(k_bf16), out_dtype=tl.float32)
+        scores = scores / (cr[:, None] + EPS)
+        scores = scores + tl.where(k_valid[None, :], 0.0, float("-inf"))
+
+        # Online softmax update
+        tile_max = tl.max(scores, axis=1)
+        new_max = tl.maximum(max_rows, tile_max)
+        scale = tl.exp(max_rows - new_max)
+
+        al_acc = al_acc * scale[:, None]
+        y_acc = y_acc * scale[:, None]
+        sum_rows = sum_rows * scale
+        score_acc = score_acc * scale
+
+        exp_scores = tl.exp(scores - new_max[:, None])
+        al_acc = al_acc + tl.dot(exp_scores.to(tl.bfloat16), k_bf16, out_dtype=tl.float32)
+        y_acc = y_acc + tl.dot(exp_scores.to(tl.bfloat16), v_bf16, out_dtype=tl.float32)
+        score_acc = score_acc + tl.sum(exp_scores * scores, axis=1)
+        sum_rows = sum_rows + tl.sum(exp_scores, axis=1)
+        max_rows = new_max
+
+    # Finalize outputs
+    safe_sum = tl.where(sum_rows > 0, sum_rows, 1.0)
+    al = (sm_scale * al_acc / safe_sum[:, None]).to(ar.dtype)
+    y = (y_acc / safe_sum[:, None]).to(ar.dtype)
+    cl = tl.where(sum_rows > 0, score_acc / safe_sum - max_rows - tl.log(safe_sum), 0.0)
+
+    # Store al
+    al_base = al_ptr + stride_al_e * idx_e + stride_al_h * idx_h + stride_al_m * idx_m
+    al_offset = stride_al_b * range_q[:, None] + range_d[None, :]
+    tl.store(al_base + al_offset, al, mask=mask_q[:, None] & mask_d[None, :])
+
+    # Store y
+    y_base = y_ptr + stride_y_e * idx_e + stride_y_h * idx_h + stride_y_m * idx_m
+    y_offset = stride_y_b * range_q[:, None] + range_d[None, :]
+    tl.store(y_base + y_offset, y, mask=mask_q[:, None] & mask_d[None, :])
+
+    # Store cl
+    cl_base = cl_ptr + stride_cl_e * idx_e + stride_cl_h * idx_h + stride_cl_m * idx_m
+    tl.store(cl_base + stride_cl_b * range_q, cl, mask=mask_q)
 
 
 @triton.jit
@@ -1376,8 +1699,13 @@ def monarch_attention_triton(
     grid_ehb = (E * H, B)
 
     # Block sizes must be powers of 2 and >= actual dimensions for Triton
-    BLOCK_B = max(triton.next_power_of_2(B), 16)
     BLOCK_D = max(triton.next_power_of_2(D), 16)
+
+    # For large B, use tiled within-block kernels with online softmax
+    MAX_BLOCK_B = 128
+    use_tiled_b_kernels = B > MAX_BLOCK_B
+    TILED_BLOCK_B = 64  # tile size for B-dim tiling
+    BLOCK_B = max(triton.next_power_of_2(B), 16) if not use_tiled_b_kernels else TILED_BLOCK_B
 
     # For large M, cap BLOCK_M and use tiled kernels
     # The non-tiled kernels compute MxM attention matrices which exceed memory for large M
@@ -1427,34 +1755,67 @@ def monarch_attention_triton(
     for t in range(T - 1):
         is_first_call = t == 0
         _ar = q if is_first_call else ar
-        _al_cl_kernel[grid_ehm](
-            _ar,
-            *ar_strides,
-            k,
-            *k_strides,
-            cr,
-            *cr_strides,
-            al,
-            *al_strides,
-            cl,
-            *cl_strides,
-            attn_mask,
-            *attn_mask_strides,
-            sm_scale,
-            HAS_ATTN_MASK=attn_mask is not None,  # type: ignore
-            BLOCK_B=BLOCK_B,  # type: ignore
-            BLOCK_D=BLOCK_D,  # type: ignore
-            PRE_PAD=pre_pad,  # type: ignore
-            EPS=eps,  # type: ignore
-            IS_FIRST_CALL=is_first_call,  # type: ignore
-            H=H,  # type: ignore
-            M=M,  # type: ignore
-            B=B,  # type: ignore
-            D=D,  # type: ignore
-            N=N,  # type: ignore
-            num_warps=num_warps_b,
-            num_stages=num_stages,
-        )
+        if use_tiled_b_kernels:
+            num_q_tiles_b = triton.cdiv(B, TILED_BLOCK_B)
+            grid_tiled_b = (E * H, M, num_q_tiles_b)
+            num_warps_tb = get_optimal_num_warps(TILED_BLOCK_B, BLOCK_D)
+            _al_cl_kernel_tiled[grid_tiled_b](
+                _ar,
+                *ar_strides,
+                k,
+                *k_strides,
+                cr,
+                *cr_strides,
+                al,
+                *al_strides,
+                cl,
+                *cl_strides,
+                attn_mask,
+                *attn_mask_strides,
+                sm_scale,
+                HAS_ATTN_MASK=attn_mask is not None,  # type: ignore
+                TILE_B=TILED_BLOCK_B,  # type: ignore
+                BLOCK_D=BLOCK_D,  # type: ignore
+                PRE_PAD=pre_pad,  # type: ignore
+                EPS=eps,  # type: ignore
+                IS_FIRST_CALL=is_first_call,  # type: ignore
+                H=H,  # type: ignore
+                M=M,  # type: ignore
+                B=B,  # type: ignore
+                D=D,  # type: ignore
+                N=N,  # type: ignore
+                num_warps=num_warps_tb,
+                num_stages=num_stages,
+            )
+        else:
+            _al_cl_kernel[grid_ehm](
+                _ar,
+                *ar_strides,
+                k,
+                *k_strides,
+                cr,
+                *cr_strides,
+                al,
+                *al_strides,
+                cl,
+                *cl_strides,
+                attn_mask,
+                *attn_mask_strides,
+                sm_scale,
+                HAS_ATTN_MASK=attn_mask is not None,  # type: ignore
+                BLOCK_B=BLOCK_B,  # type: ignore
+                BLOCK_D=BLOCK_D,  # type: ignore
+                PRE_PAD=pre_pad,  # type: ignore
+                EPS=eps,  # type: ignore
+                IS_FIRST_CALL=is_first_call,  # type: ignore
+                H=H,  # type: ignore
+                M=M,  # type: ignore
+                B=B,  # type: ignore
+                D=D,  # type: ignore
+                N=N,  # type: ignore
+                num_warps=num_warps_b,
+                num_stages=num_stages,
+            )
 
         if use_tiled_kernels:
             # Use tiled kernels for large M
@@ -1581,37 +1942,73 @@ def monarch_attention_triton(
     y = torch.empty_like(al)
     y_strides = (y.stride(0), y.stride(1), y.stride(2), y.stride(3), y.stride(4))
 
-    _al_y_cl_kernel[grid_ehm](
-        ar,
-        *ar_strides,
-        k,
-        *k_strides,
-        v,
-        *v_strides,
-        cr,
-        *cr_strides,
-        al,
-        *al_strides,
-        y,
-        *y_strides,
-        cl,
-        *cl_strides,
-        attn_mask,
-        *attn_mask_strides,
-        sm_scale,
-        HAS_ATTN_MASK=attn_mask is not None,  # type: ignore
-        BLOCK_B=BLOCK_B,  # type: ignore
-        BLOCK_D=BLOCK_D,  # type: ignore
-        PRE_PAD=pre_pad,  # type: ignore
-        EPS=eps,  # type: ignore
-        H=H,  # type: ignore
-        M=M,  # type: ignore
-        B=B,  # type: ignore
-        D=D,  # type: ignore
-        N=N,  # type: ignore
-        num_warps=num_warps_b,
-        num_stages=num_stages,
-    )
+    if use_tiled_b_kernels:
+        num_q_tiles_b = triton.cdiv(B, TILED_BLOCK_B)
+        grid_tiled_b = (E * H, M, num_q_tiles_b)
+        num_warps_tb = get_optimal_num_warps(TILED_BLOCK_B, BLOCK_D)
+        _al_y_cl_kernel_tiled[grid_tiled_b](
+            ar,
+            *ar_strides,
+            k,
+            *k_strides,
+            v,
+            *v_strides,
+            cr,
+            *cr_strides,
+            al,
+            *al_strides,
+            y,
+            *y_strides,
+            cl,
+            *cl_strides,
+            attn_mask,
+            *attn_mask_strides,
+            sm_scale,
+            HAS_ATTN_MASK=attn_mask is not None,  # type: ignore
+            TILE_B=TILED_BLOCK_B,  # type: ignore
+            BLOCK_D=BLOCK_D,  # type: ignore
+            PRE_PAD=pre_pad,  # type: ignore
+            EPS=eps,  # type: ignore
+            H=H,  # type: ignore
+            M=M,  # type: ignore
+            B=B,  # type: ignore
+            D=D,  # type: ignore
+            N=N,  # type: ignore
+            num_warps=num_warps_tb,
+            num_stages=num_stages,
+        )
+    else:
+        _al_y_cl_kernel[grid_ehm](
+            ar,
+            *ar_strides,
+            k,
+            *k_strides,
+            v,
+            *v_strides,
+            cr,
+            *cr_strides,
+            al,
+            *al_strides,
+            y,
+            *y_strides,
+            cl,
+            *cl_strides,
+            attn_mask,
+            *attn_mask_strides,
+            sm_scale,
+            HAS_ATTN_MASK=attn_mask is not None,  # type: ignore
+            BLOCK_B=BLOCK_B,  # type: ignore
+            BLOCK_D=BLOCK_D,  # type: ignore
+            PRE_PAD=pre_pad,  # type: ignore
+            EPS=eps,  # type: ignore
+            H=H,  # type: ignore
+            M=M,  # type: ignore
+            B=B,  # type: ignore
+            D=D,  # type: ignore
+            N=N,  # type: ignore
+            num_warps=num_warps_b,
+            num_stages=num_stages,
+        )
 
     z = torch.empty_like(v)
     z_strides = (z.stride(0), z.stride(1), B * z.stride(2), z.stride(2), z.stride(3))
