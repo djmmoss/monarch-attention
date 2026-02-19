@@ -19,7 +19,7 @@ Benchmark results across optimization stages on the `triton-optimization` branch
 | 131072 | FAIL | 43.196 | *1.00x* | 12.668 | **3.41x** | 8.041 | **5.37x** | 6.607 | **6.54x** | 4.166 | **10.37x** | 4.147 | **10.42x** |
 | 262144 | FAIL | 177.886 | *1.00x* | 46.184 | **3.85x** | 18.526 | **9.60x** | 15.471 | **11.50x** | 10.563 | **16.86x** | 10.538 | **16.87x** |
 | 524288 | FAIL | 717.383 | *1.00x* | 181.234 | **3.96x** | 45.816 | **15.66x** | 37.274 | **19.24x** | 32.625 | **21.99x** | 32.930 | **21.78x** |
-| 1048576 | FAIL | OOM | — | 722.851 | *1.00x* | 204.756 | **3.53x** | 179.188 | **4.04x** | — | — | — | — |
+| 1048576 | FAIL | OOM | — | 722.851 | *1.00x* | 204.756 | **3.53x** | 179.188 | **4.04x** | 113.011 | **6.40x** | 113.011 | **6.40x** |
 
 Speedups are relative to the earliest valid result for each row. *1.00x* marks the baseline. FAIL = Triton compiler crash. OOM = out of memory.
 
@@ -33,7 +33,7 @@ Speedups are relative to the earliest valid result for each row. *1.00x* marks t
 | 3 | `27e9da2` | Tiled within-block (B×B) kernels to remove B=128 cap |
 | 4 | `6bc4cd2` | @triton.autotune and software pipelining (num_stages=3) on tiled kernels |
 | 5 | `380e683` | Add num_warps=2 to autotune config space for tiled kernels |
-| 6 | *(pending)* | CUDA graph capture for non-tiled kernels (N ≤ 4096) |
+| 6 | `9487175`, `5ab250a` | CUDA graph capture for non-tiled kernels (N ≤ 4096) + tiled threshold fix for N=16384 |
 
 ## Key Observations
 
@@ -44,4 +44,4 @@ Speedups are relative to the earliest valid result for each row. *1.00x* marks t
 - **N ≥ 16384**: Main branch fails entirely; steps 1–5 progressively improve performance
 - **N = 65k–262k**: Step 5 (num_warps=2) gave 1.4–1.6x improvement over step 4 on tiled _ar_cr kernels
 - **N = 524k**: Steps 1→5 achieved 22x cumulative speedup (717ms → 33ms)
-- **N = 1M**: Steps 2→4 achieved 4.0x speedup (723ms → 179ms); step 1 OOMs with B=32 (M=32768)
+- **N = 1M**: Steps 2→5 achieved 6.4x speedup (723ms → 113ms); step 1 OOMs with B=32 (M=32768)

@@ -36,28 +36,37 @@ def benchmark_monarch_attention():
 
         # Warmup and correctness check
         try:
-            out_torch = ma_torch(Q, K, V, None, T, B, pre_pad=True)
+            # Try torch first (may OOM at large N)
+            try:
+                out_torch = ma_torch(Q, K, V, None, T, B, pre_pad=True)
+                torch.cuda.synchronize()
+                torch_ok = True
+            except torch.cuda.OutOfMemoryError:
+                torch_ok = False
+                torch.cuda.empty_cache()
+
             out_triton = ma_triton(Q, K, V, None, T, B, pre_pad=True)
             torch.cuda.synchronize()
 
-            max_diff = (out_torch - out_triton).abs().max().item()
-
-            # Benchmark torch
-            def run_torch():
-                return ma_torch(Q, K, V, None, T, B, pre_pad=True)
-
-            # Benchmark triton
             def run_triton():
                 return ma_triton(Q, K, V, None, T, B, pre_pad=True)
 
-            ms_torch = triton.testing.do_bench(run_torch, warmup=5, rep=20)
             ms_triton = triton.testing.do_bench(run_triton, warmup=5, rep=20)
 
-            speedup = ms_torch / ms_triton
-            print(f"{N:>10} {B:>5} {M:>6} {ms_torch:>12.3f} {ms_triton:>12.3f} {speedup:>10.2f}x {max_diff:>10.6f}")
+            if torch_ok:
+                max_diff = (out_torch - out_triton).abs().max().item()
+
+                def run_torch():
+                    return ma_torch(Q, K, V, None, T, B, pre_pad=True)
+
+                ms_torch = triton.testing.do_bench(run_torch, warmup=5, rep=20)
+                speedup = ms_torch / ms_triton
+                print(f"{N:>10} {B:>5} {M:>6} {ms_torch:>12.3f} {ms_triton:>12.3f} {speedup:>10.2f}x {max_diff:>10.6f}")
+            else:
+                print(f"{N:>10} {B:>5} {M:>6} {'OOM':>12} {ms_triton:>12.3f} {'--':>10} {'--':>10}")
 
         except torch.cuda.OutOfMemoryError:
-            print(f"{N:>10} {B:>5} {M:>6} {'OOM':>12}")
+            print(f"{N:>10} {B:>5} {M:>6} {'OOM':>12} {'OOM':>12}")
         except Exception as e:
             print(f"{N:>10} {B:>5} {M:>6} ERROR: {str(e)[:40]}")
 
