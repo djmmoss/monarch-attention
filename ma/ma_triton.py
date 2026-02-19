@@ -33,6 +33,46 @@ def check_inputs(q, k, v):
 Tensor = torch.Tensor
 
 
+# =============================================================================
+# Autotuning configurations for tiled kernels (large-M / large-B hot path)
+# Non-tiled kernels use fixed heuristics since they only run for small dims.
+# =============================================================================
+
+def _get_tiled_m_autotune_configs():
+    """Configs for kernels with autotuned TILE_M (e.g., _z_kernel_tiled)."""
+    configs = []
+    for tile_m in [32, 64, 128]:
+        for num_warps in [4, 8]:
+            for num_stages in [2, 3, 4]:
+                configs.append(triton.Config(
+                    {'TILE_M': tile_m}, num_warps=num_warps, num_stages=num_stages,
+                ))
+    return configs
+
+
+def _get_tiled_b_autotune_configs():
+    """Configs for kernels with autotuned TILE_B (e.g., _al_cl_kernel_tiled)."""
+    configs = []
+    for tile_b in [32, 64, 128]:
+        for num_warps in [4, 8]:
+            for num_stages in [2, 3, 4]:
+                configs.append(triton.Config(
+                    {'TILE_B': tile_b}, num_warps=num_warps, num_stages=num_stages,
+                ))
+    return configs
+
+
+def _get_warp_stage_autotune_configs():
+    """Configs for kernels where only num_warps/num_stages are tuned."""
+    configs = []
+    for num_warps in [4, 8]:
+        for num_stages in [2, 3, 4]:
+            configs.append(triton.Config(
+                {}, num_warps=num_warps, num_stages=num_stages,
+            ))
+    return configs
+
+
 @triton.jit
 def xlogx(x):
     return tl.where(x == 0, 0.0, x * tl.log(x))
@@ -167,6 +207,7 @@ def _al_cl_kernel(
     tl.store(al_base + al_offset, al, mask=mask_b[:, None] & mask_d[None, :])
 
 
+@triton.autotune(configs=_get_tiled_b_autotune_configs(), key=['B', 'D'])
 @triton.jit
 def _al_cl_kernel_tiled(
     ar_ptr,
@@ -263,7 +304,7 @@ def _al_cl_kernel_tiled(
     k_base = k_ptr + stride_k_e * idx_e + stride_k_h * idx_h + stride_k_m * idx_m
     range_k = tl.arange(0, TILE_B)
 
-    for k_start in tl.range(0, B, TILE_B):
+    for k_start in tl.range(0, B, TILE_B, num_stages=3):
         k_range = k_start + range_k
         k_mask = k_range < B
         if PRE_PAD:
@@ -639,6 +680,7 @@ def _al_y_cl_kernel(
     )
 
 
+@triton.autotune(configs=_get_tiled_b_autotune_configs(), key=['B', 'D'])
 @triton.jit
 def _al_y_cl_kernel_tiled(
     ar_ptr,
@@ -740,7 +782,7 @@ def _al_y_cl_kernel_tiled(
     v_base = v_ptr + stride_v_e * idx_e + stride_v_h * idx_h + stride_v_m * idx_m
     range_k = tl.arange(0, TILE_B)
 
-    for k_start in tl.range(0, B, TILE_B):
+    for k_start in tl.range(0, B, TILE_B, num_stages=3):
         k_range = k_start + range_k
         k_mask = k_range < B
         if PRE_PAD:
@@ -955,6 +997,7 @@ def _z_kernel(
 # =============================================================================
 
 
+@triton.autotune(configs=_get_warp_stage_autotune_configs(), key=['M', 'D'])
 @triton.jit
 def _ar_cr_softmax_stats_kernel(
     al_ptr, stride_al_e, stride_al_h, stride_al_m, stride_al_b, stride_al_d,
@@ -1008,7 +1051,7 @@ def _ar_cr_softmax_stats_kernel(
 
     # Iterate over row tiles (i dimension of al)
     range_i = tl.arange(0, TILE_M)
-    for i_start in tl.range(0, M, TILE_M):
+    for i_start in tl.range(0, M, TILE_M, num_stages=3):
         i_range = i_start + range_i
         i_mask = i_range < M
 
@@ -1064,6 +1107,7 @@ def _ar_cr_softmax_stats_kernel(
     tl.store(sum_block_ptr, sum_cols, mask=out_mask)
 
 
+@triton.autotune(configs=_get_warp_stage_autotune_configs(), key=['M', 'D'])
 @triton.jit
 def _ar_cr_accumulate_kernel(
     al_ptr, stride_al_e, stride_al_h, stride_al_m, stride_al_b, stride_al_d,
@@ -1118,7 +1162,7 @@ def _ar_cr_accumulate_kernel(
 
     # Iterate over column tiles (j dimension)
     range_j = tl.arange(0, TILE_M)
-    for j_start in tl.range(0, M, TILE_M):
+    for j_start in tl.range(0, M, TILE_M, num_stages=3):
         j_range = j_start + range_j
         j_mask = j_range < M
         # Simplified mask computation
@@ -1390,6 +1434,7 @@ def _ar_cr_accumulate_kernel_tma(
     tl.store(cr_block_ptr, cr_acc, mask=i_mask)
 
 
+@triton.autotune(configs=_get_tiled_m_autotune_configs(), key=['M', 'D'])
 @triton.jit
 def _z_kernel_tiled(
     al_ptr, stride_al_e, stride_al_h, stride_al_m, stride_al_b, stride_al_d,
@@ -1443,7 +1488,7 @@ def _z_kernel_tiled(
 
     # Iterate over column tiles (j dimension - al/y positions)
     range_j = tl.arange(0, TILE_M)
-    for j_start in tl.range(0, M, TILE_M):
+    for j_start in tl.range(0, M, TILE_M, num_stages=3):
         j_range = j_start + range_j
         j_mask = j_range < M
 
@@ -1702,16 +1747,17 @@ def monarch_attention_triton(
     BLOCK_D = max(triton.next_power_of_2(D), 16)
 
     # For large B, use tiled within-block kernels with online softmax
+    # TILE_B for tiled kernels is autotuned by @triton.autotune
     MAX_BLOCK_B = 128
     use_tiled_b_kernels = B > MAX_BLOCK_B
-    TILED_BLOCK_B = 64  # tile size for B-dim tiling
-    BLOCK_B = max(triton.next_power_of_2(B), 16) if not use_tiled_b_kernels else TILED_BLOCK_B
+    BLOCK_B = max(triton.next_power_of_2(B), 16) if not use_tiled_b_kernels else 64
 
     # For large M, cap BLOCK_M and use tiled kernels
     # The non-tiled kernels compute MxM attention matrices which exceed memory for large M
     raw_block_m = max(triton.next_power_of_2(M), 16)
     MAX_BLOCK_M = 128  # Maximum single-block M size for non-tiled kernels
-    # For tiled kernels, TILE_M=64 is faster than 128 due to register pressure
+    # For tiled kernels, TILE_M is autotuned by @triton.autotune for _z_kernel_tiled.
+    # For the ar_cr pair, TILE_M must match between stats and accumulate kernels.
     TILED_BLOCK_M = 64
     use_tiled_kernels = raw_block_m > MAX_BLOCK_M
     BLOCK_M = min(raw_block_m, MAX_BLOCK_M)
@@ -1723,7 +1769,7 @@ def monarch_attention_triton(
     # Future work: transpose to [E,H,B,M,D] layout for TMA benefits
     use_tma = False
 
-    # Optimal warp and stage counts for B200
+    # Warp and stage counts for non-autotuned kernels (small M/B path)
     num_warps_b = get_optimal_num_warps(BLOCK_B, BLOCK_D)
     num_warps_m = get_optimal_num_warps(BLOCK_M, BLOCK_D)
     num_stages = get_optimal_num_stages(BLOCK_B, BLOCK_D)
@@ -1756,10 +1802,9 @@ def monarch_attention_triton(
         is_first_call = t == 0
         _ar = q if is_first_call else ar
         if use_tiled_b_kernels:
-            num_q_tiles_b = triton.cdiv(B, TILED_BLOCK_B)
-            grid_tiled_b = (E * H, M, num_q_tiles_b)
-            num_warps_tb = get_optimal_num_warps(TILED_BLOCK_B, BLOCK_D)
-            _al_cl_kernel_tiled[grid_tiled_b](
+            # Grid uses lambda — TILE_B comes from autotuning
+            grid_al_cl_tiled = lambda META: (E * H, M, triton.cdiv(B, META['TILE_B']))
+            _al_cl_kernel_tiled[grid_al_cl_tiled](
                 _ar,
                 *ar_strides,
                 k,
@@ -1774,7 +1819,6 @@ def monarch_attention_triton(
                 *attn_mask_strides,
                 sm_scale,
                 HAS_ATTN_MASK=attn_mask is not None,  # type: ignore
-                TILE_B=TILED_BLOCK_B,  # type: ignore
                 BLOCK_D=BLOCK_D,  # type: ignore
                 PRE_PAD=pre_pad,  # type: ignore
                 EPS=eps,  # type: ignore
@@ -1784,8 +1828,6 @@ def monarch_attention_triton(
                 B=B,  # type: ignore
                 D=D,  # type: ignore
                 N=N,  # type: ignore
-                num_warps=num_warps_tb,
-                num_stages=num_stages,
             )
         else:
             _al_cl_kernel[grid_ehm](
@@ -1819,10 +1861,9 @@ def monarch_attention_triton(
 
         if use_tiled_kernels:
             # Use tiled kernels for large M
-            # TILED_BLOCK_M=64 is faster than 128 due to reduced register pressure
+            # TILE_M must match between stats and accumulate kernels
             num_m_tiles = triton.cdiv(M, TILED_BLOCK_M)
             grid_tiled = (E * H, B, num_m_tiles)
-            num_warps_tiled = get_optimal_num_warps(TILED_BLOCK_M, BLOCK_D)
 
             # Allocate intermediate buffers for softmax stats
             softmax_max = torch.empty(E, H, M, B, device=q.device, dtype=torch.float32)
@@ -1831,6 +1872,7 @@ def monarch_attention_triton(
             sum_strides = (softmax_sum.stride(0), softmax_sum.stride(1), softmax_sum.stride(2), softmax_sum.stride(3))
 
             if use_tma:
+                num_warps_tiled = get_optimal_num_warps(TILED_BLOCK_M, BLOCK_D)
                 # Use TMA-optimized kernels with software pipelining for M > 4096
                 # Phase 1: Compute softmax stats with TMA
                 _ar_cr_softmax_stats_kernel_tma[grid_tiled](
@@ -1872,7 +1914,7 @@ def monarch_attention_triton(
                     num_stages=num_stages,
                 )
             else:
-                # Use regular tiled kernels for moderate M (128 < M <= 4096)
+                # Autotuned tiled kernels (num_warps/num_stages chosen by @triton.autotune)
                 # Phase 1: Compute softmax stats
                 _ar_cr_softmax_stats_kernel[grid_tiled](
                     al, *al_strides,
@@ -1888,8 +1930,6 @@ def monarch_attention_triton(
                     B=B,  # type: ignore
                     D=D,  # type: ignore
                     N=N,  # type: ignore
-                    num_warps=num_warps_tiled,
-                    num_stages=num_stages,
                 )
 
                 # Phase 2: Accumulate ar and cr
@@ -1909,8 +1949,6 @@ def monarch_attention_triton(
                     B=B,  # type: ignore
                     D=D,  # type: ignore
                     N=N,  # type: ignore
-                    num_warps=num_warps_tiled,
-                    num_stages=num_stages,
                 )
         else:
             _ar_cr_kernel[grid_ehb](
@@ -1943,10 +1981,9 @@ def monarch_attention_triton(
     y_strides = (y.stride(0), y.stride(1), y.stride(2), y.stride(3), y.stride(4))
 
     if use_tiled_b_kernels:
-        num_q_tiles_b = triton.cdiv(B, TILED_BLOCK_B)
-        grid_tiled_b = (E * H, M, num_q_tiles_b)
-        num_warps_tb = get_optimal_num_warps(TILED_BLOCK_B, BLOCK_D)
-        _al_y_cl_kernel_tiled[grid_tiled_b](
+        # Grid uses lambda — TILE_B comes from autotuning
+        grid_al_y_cl_tiled = lambda META: (E * H, M, triton.cdiv(B, META['TILE_B']))
+        _al_y_cl_kernel_tiled[grid_al_y_cl_tiled](
             ar,
             *ar_strides,
             k,
@@ -1965,7 +2002,6 @@ def monarch_attention_triton(
             *attn_mask_strides,
             sm_scale,
             HAS_ATTN_MASK=attn_mask is not None,  # type: ignore
-            TILE_B=TILED_BLOCK_B,  # type: ignore
             BLOCK_D=BLOCK_D,  # type: ignore
             PRE_PAD=pre_pad,  # type: ignore
             EPS=eps,  # type: ignore
@@ -1974,8 +2010,6 @@ def monarch_attention_triton(
             B=B,  # type: ignore
             D=D,  # type: ignore
             N=N,  # type: ignore
-            num_warps=num_warps_tb,
-            num_stages=num_stages,
         )
     else:
         _al_y_cl_kernel[grid_ehm](
@@ -2014,14 +2048,11 @@ def monarch_attention_triton(
     z_strides = (z.stride(0), z.stride(1), B * z.stride(2), z.stride(2), z.stride(3))
 
     if use_tiled_kernels:
-        # Use tiled z kernel for large M (Flash Attention style)
-        # TILED_BLOCK_M=64 is faster than 128 due to reduced register pressure
-        num_m_tiles = triton.cdiv(M, TILED_BLOCK_M)
-        grid_tiled_z = (E * H, B, num_m_tiles)
-        num_warps_tiled = get_optimal_num_warps(TILED_BLOCK_M, BLOCK_D)
-
         if use_tma:
             # Use TMA-optimized kernel with software pipelining for M > 4096
+            num_m_tiles = triton.cdiv(M, TILED_BLOCK_M)
+            grid_tiled_z = (E * H, B, num_m_tiles)
+            num_warps_tiled = get_optimal_num_warps(TILED_BLOCK_M, BLOCK_D)
             _z_kernel_tiled_tma[grid_tiled_z](
                 al, *al_strides,
                 q, *q_strides,
@@ -2040,14 +2071,14 @@ def monarch_attention_triton(
                 num_stages=num_stages,
             )
         else:
-            # Use regular tiled kernel for moderate M (128 < M <= 4096)
-            _z_kernel_tiled[grid_tiled_z](
+            # Autotuned tiled z kernel — TILE_M, num_warps, num_stages from @triton.autotune
+            grid_z_tiled = lambda META: (E * H, B, triton.cdiv(M, META['TILE_M']))
+            _z_kernel_tiled[grid_z_tiled](
                 al, *al_strides,
                 q, *q_strides,
                 y, *y_strides,
                 cl, *cl_strides,
                 z, *z_strides,
-                TILE_M=TILED_BLOCK_M,  # type: ignore
                 BLOCK_D=BLOCK_D,  # type: ignore
                 PRE_PAD=pre_pad,  # type: ignore
                 H=H,  # type: ignore
@@ -2055,8 +2086,6 @@ def monarch_attention_triton(
                 B=B,  # type: ignore
                 D=D,  # type: ignore
                 N=N,  # type: ignore
-                num_warps=num_warps_tiled,
-                num_stages=num_stages,
             )
     else:
         _z_kernel[grid_ehb](
