@@ -1,11 +1,4 @@
-import os
 from math import sqrt
-
-DEBUG = False
-
-if DEBUG:
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-    os.environ["TRITON_INTERPRET"] = "1"
 
 import torch
 import triton
@@ -18,22 +11,6 @@ import triton.language as tl
 # Key: (E, H, N, D, B, T, pre_pad, has_mask, dtype, eps)
 _cuda_graph_cache: dict = {}
 
-# TMA allocator setup (required for TMA descriptor operations)
-_tma_allocator_set = False
-
-
-def _ensure_tma_allocator():
-    """Set up TMA allocator if not already done."""
-    global _tma_allocator_set
-    if not _tma_allocator_set:
-        def torch_allocator(size, align, stream):
-            return torch.empty(size, dtype=torch.uint8, device='cuda').data_ptr()
-        triton.set_allocator(torch_allocator)
-        _tma_allocator_set = True
-
-
-def check_inputs(q, k, v):
-    pass
 
 
 Tensor = torch.Tensor
@@ -98,6 +75,12 @@ def _al_cl_kernel(
     stride_k_m,
     stride_k_b,
     stride_k_d,
+    v_ptr,
+    stride_v_e,
+    stride_v_h,
+    stride_v_m,
+    stride_v_b,
+    stride_v_d,
     cr_ptr,
     stride_cr_e,
     stride_cr_h,
@@ -109,6 +92,12 @@ def _al_cl_kernel(
     stride_al_m,
     stride_al_b,
     stride_al_d,
+    y_ptr,
+    stride_y_e,
+    stride_y_h,
+    stride_y_m,
+    stride_y_b,
+    stride_y_d,
     cl_ptr,
     stride_cl_e,
     stride_cl_h,
@@ -124,7 +113,7 @@ def _al_cl_kernel(
     BLOCK_D: tl.constexpr,
     PRE_PAD: tl.constexpr,
     EPS: tl.constexpr,
-    IS_FIRST_CALL: tl.constexpr,
+    COMPUTE_Y: tl.constexpr,
     H: tl.constexpr,
     M: tl.constexpr,
     B: tl.constexpr,
@@ -149,15 +138,12 @@ def _al_cl_kernel(
     mask_d = range_d < D
 
     # k_mask_b: valid positions that are within the actual sequence
-    # For PRE_PAD: positions where (block_start_n + range_b) >= pad_offset
-    # For POST_PAD: positions where (block_start_n + range_b) < N
     if PRE_PAD:
         k_mask_b = mask_b & ((block_start_n + range_b) >= pad_offset)
     else:
         k_mask_b = mask_b & ((block_start_n + range_b) < N)
 
     # Pre-compute base pointers (reduces repeated arithmetic)
-    # Common offset for tensors indexed by [e, h, m, ...]
     base_ehm = stride_ar_e * idx_e + stride_ar_h * idx_h + stride_ar_m * idx_m
 
     if HAS_ATTN_MASK:
@@ -166,20 +152,16 @@ def _al_cl_kernel(
         valid_token_mask = tl.load(mask_block_ptr, mask=k_mask_b, other=0)
         k_mask_b = k_mask_b & valid_token_mask
 
-    # Pre-compute 2D offset pattern for [BLOCK_B, BLOCK_D] loads
-    # Assumes stride_d = 1 (contiguous tensors) for coalesced access
-    offset_2d = stride_ar_b * range_b[:, None] + range_d[None, :]
-
-    # Load ar - use pre-computed base and offset
+    # Load ar (always from [E,H,M,B,D] tensor - q is pre-copied into ar)
     ar_base = ar_ptr + base_ehm
-    ar_offset = stride_ar_b * (range_b - (pad_offset if IS_FIRST_CALL else 0))[:, None] + range_d[None, :]
+    ar_offset = stride_ar_b * range_b[:, None] + range_d[None, :]
     ar = tl.load(
         ar_base + ar_offset,
-        mask=(k_mask_b if IS_FIRST_CALL else mask_b)[:, None] & mask_d[None, :],
+        mask=mask_b[:, None] & mask_d[None, :],
         other=0.0,
     )
 
-    # Load k - similar pattern with k's strides
+    # Load k
     k_base = k_ptr + stride_k_e * idx_e + stride_k_h * idx_h + stride_k_m * idx_m
     k_offset = stride_k_b * (range_b - pad_offset)[:, None] + range_d[None, :]
     k = tl.load(
@@ -201,7 +183,7 @@ def _al_cl_kernel(
     r = tl.exp(r - tl.clamp(tl.max(r, axis=1, keep_dims=True), EPS, float("inf")))
     r = r / (tl.sum(r, axis=1, keep_dims=True) + EPS)
 
-    # Store cl - use pre-computed base (same pattern as cr)
+    # Store cl
     cl = tl.sum(xlogx(r), axis=1)
     cl_base = cl_ptr + stride_cl_e * idx_e + stride_cl_h * idx_h + stride_cl_m * idx_m
     tl.store(cl_base + stride_cl_b * range_b, cl, mask=mask_b)
@@ -209,8 +191,23 @@ def _al_cl_kernel(
     # Store al - use bf16 for tensor cores, cast back to input dtype
     al = (sm_scale * tl.dot(r.to(tl.bfloat16), k_bf16, out_dtype=tl.float32)).to(ar.dtype)
     al_base = al_ptr + stride_al_e * idx_e + stride_al_h * idx_h + stride_al_m * idx_m
-    al_offset = stride_al_b * range_b[:, None] + range_d[None, :]  # Assumes stride_al_d = 1
+    al_offset = stride_al_b * range_b[:, None] + range_d[None, :]
     tl.store(al_base + al_offset, al, mask=mask_b[:, None] & mask_d[None, :])
+
+    if COMPUTE_Y:
+        # Load v and compute y = r @ v
+        v_base = v_ptr + stride_v_e * idx_e + stride_v_h * idx_h + stride_v_m * idx_m
+        v_offset = stride_v_b * (range_b - pad_offset)[:, None] + range_d[None, :]
+        v = tl.load(
+            v_base + v_offset,
+            mask=k_mask_b[:, None] & mask_d[None, :],
+            other=0.0,
+        )
+        v_bf16 = v.to(tl.bfloat16)
+        y = tl.dot(r.to(tl.bfloat16), v_bf16, out_dtype=tl.float32).to(ar.dtype)
+        y_base = y_ptr + stride_y_e * idx_e + stride_y_h * idx_h + stride_y_m * idx_m
+        y_offset = stride_y_b * range_b[:, None] + range_d[None, :]
+        tl.store(y_base + y_offset, y, mask=mask_b[:, None] & mask_d[None, :])
 
 
 @triton.autotune(configs=_get_tiled_b_autotune_configs(), key=['B', 'D'])
@@ -228,6 +225,12 @@ def _al_cl_kernel_tiled(
     stride_k_m,
     stride_k_b,
     stride_k_d,
+    v_ptr,
+    stride_v_e,
+    stride_v_h,
+    stride_v_m,
+    stride_v_b,
+    stride_v_d,
     cr_ptr,
     stride_cr_e,
     stride_cr_h,
@@ -239,6 +242,12 @@ def _al_cl_kernel_tiled(
     stride_al_m,
     stride_al_b,
     stride_al_d,
+    y_ptr,
+    stride_y_e,
+    stride_y_h,
+    stride_y_m,
+    stride_y_b,
+    stride_y_d,
     cl_ptr,
     stride_cl_e,
     stride_cl_h,
@@ -254,7 +263,7 @@ def _al_cl_kernel_tiled(
     BLOCK_D: tl.constexpr,
     PRE_PAD: tl.constexpr,
     EPS: tl.constexpr,
-    IS_FIRST_CALL: tl.constexpr,
+    COMPUTE_Y: tl.constexpr,
     H: tl.constexpr,
     M: tl.constexpr,
     B: tl.constexpr,
@@ -264,6 +273,7 @@ def _al_cl_kernel_tiled(
     """Tiled version of _al_cl_kernel for large B (>128).
 
     Uses online softmax to tile over key positions, avoiding B×B attention matrices.
+    When COMPUTE_Y=True, also accumulates y = r @ v.
     Grid: (E*H, M, cdiv(B, TILE_B))
     """
     idx_eh = tl.program_id(0)
@@ -282,18 +292,10 @@ def _al_cl_kernel_tiled(
     mask_q = range_q < B
     mask_d = range_d < D
 
-    # Load ar (query rows for this tile)
+    # Load ar (always from [E,H,M,B,D] tensor - q is pre-copied into ar)
     ar_base = ar_ptr + stride_ar_e * idx_e + stride_ar_h * idx_h + stride_ar_m * idx_m
-    if IS_FIRST_CALL:
-        ar_offset = stride_ar_b * (range_q - pad_offset)[:, None] + range_d[None, :]
-        if PRE_PAD:
-            q_load_mask = mask_q & ((block_start_n + range_q) >= pad_offset)
-        else:
-            q_load_mask = mask_q & ((block_start_n + range_q) < N)
-        ar = tl.load(ar_base + ar_offset, mask=q_load_mask[:, None] & mask_d[None, :], other=0.0)
-    else:
-        ar_offset = stride_ar_b * range_q[:, None] + range_d[None, :]
-        ar = tl.load(ar_base + ar_offset, mask=mask_q[:, None] & mask_d[None, :], other=0.0)
+    ar_offset = stride_ar_b * range_q[:, None] + range_d[None, :]
+    ar = tl.load(ar_base + ar_offset, mask=mask_q[:, None] & mask_d[None, :], other=0.0)
     ar_bf16 = ar.to(tl.bfloat16)
 
     # Load cr for query tile
@@ -304,10 +306,14 @@ def _al_cl_kernel_tiled(
     max_rows = tl.full([TILE_B], float('-inf'), dtype=tl.float32)
     sum_rows = tl.zeros([TILE_B], dtype=tl.float32)
     al_acc = tl.zeros([TILE_B, BLOCK_D], dtype=tl.float32)
+    if COMPUTE_Y:
+        y_acc = tl.zeros([TILE_B, BLOCK_D], dtype=tl.float32)
     score_acc = tl.zeros([TILE_B], dtype=tl.float32)
 
     # Loop over key tiles
     k_base = k_ptr + stride_k_e * idx_e + stride_k_h * idx_h + stride_k_m * idx_m
+    if COMPUTE_Y:
+        v_base = v_ptr + stride_v_e * idx_e + stride_v_h * idx_h + stride_v_m * idx_m
     range_k = tl.arange(0, TILE_B)
 
     for k_start in tl.range(0, B, TILE_B, num_stages=3):
@@ -331,6 +337,12 @@ def _al_cl_kernel_tiled(
         k_tile = tl.load(k_base + k_offset, mask=k_valid[:, None] & mask_d[None, :], other=0.0)
         k_bf16 = k_tile.to(tl.bfloat16)
 
+        if COMPUTE_Y:
+            # Load value tile [TILE_B, D]
+            v_offset = stride_v_b * (k_range - pad_offset)[:, None] + range_d[None, :]
+            v_tile = tl.load(v_base + v_offset, mask=k_valid[:, None] & mask_d[None, :], other=0.0)
+            v_bf16 = v_tile.to(tl.bfloat16)
+
         # Scores [TILE_B_q, TILE_B_k]
         scores = sm_scale * tl.dot(ar_bf16, tl.trans(k_bf16), out_dtype=tl.float32)
         scores = scores / (cr[:, None] + EPS)
@@ -342,25 +354,35 @@ def _al_cl_kernel_tiled(
         scale = tl.exp(max_rows - new_max)
 
         al_acc = al_acc * scale[:, None]
+        if COMPUTE_Y:
+            y_acc = y_acc * scale[:, None]
         sum_rows = sum_rows * scale
         score_acc = score_acc * scale
 
         exp_scores = tl.exp(scores - new_max[:, None])
         al_acc = al_acc + tl.dot(exp_scores.to(tl.bfloat16), k_bf16, out_dtype=tl.float32)
+        if COMPUTE_Y:
+            y_acc = y_acc + tl.dot(exp_scores.to(tl.bfloat16), v_bf16, out_dtype=tl.float32)
         score_acc = score_acc + tl.sum(exp_scores * scores, axis=1)
         sum_rows = sum_rows + tl.sum(exp_scores, axis=1)
         max_rows = new_max
 
-    # Finalize: al = sm_scale * (sum_j exp(s-max) * k_j) / sum = sm_scale * r @ k
+    # Finalize outputs
     safe_sum = tl.where(sum_rows > 0, sum_rows, 1.0)
     al = (sm_scale * al_acc / safe_sum[:, None]).to(ar.dtype)
-    # cl = sum_j(r_ij * log(r_ij)) = score_acc/sum - max - log(sum)
     cl = tl.where(sum_rows > 0, score_acc / safe_sum - max_rows - tl.log(safe_sum), 0.0)
 
     # Store al
     al_base = al_ptr + stride_al_e * idx_e + stride_al_h * idx_h + stride_al_m * idx_m
     al_offset = stride_al_b * range_q[:, None] + range_d[None, :]
     tl.store(al_base + al_offset, al, mask=mask_q[:, None] & mask_d[None, :])
+
+    if COMPUTE_Y:
+        # Store y
+        y = (y_acc / safe_sum[:, None]).to(ar.dtype)
+        y_base = y_ptr + stride_y_e * idx_e + stride_y_h * idx_h + stride_y_m * idx_m
+        y_offset = stride_y_b * range_q[:, None] + range_d[None, :]
+        tl.store(y_base + y_offset, y, mask=mask_q[:, None] & mask_d[None, :])
 
     # Store cl
     cl_base = cl_ptr + stride_cl_e * idx_e + stride_cl_h * idx_h + stride_cl_m * idx_m
@@ -487,374 +509,6 @@ def _ar_cr_kernel(
     tl.store(ar_base + ar_offset, ar, mask=mask_m[:, None] & mask_d[None, :])
 
 
-@triton.jit
-def _al_y_cl_kernel(
-    ar_ptr,
-    stride_ar_e,
-    stride_ar_h,
-    stride_ar_m,
-    stride_ar_b,
-    stride_ar_d,
-    k_ptr,
-    stride_k_e,
-    stride_k_h,
-    stride_k_m,
-    stride_k_b,
-    stride_k_d,
-    v_ptr,
-    stride_v_e,
-    stride_v_h,
-    stride_v_m,
-    stride_v_b,
-    stride_v_d,
-    cr_ptr,
-    stride_cr_e,
-    stride_cr_h,
-    stride_cr_m,
-    stride_cr_b,
-    al_ptr,
-    stride_al_e,
-    stride_al_h,
-    stride_al_m,
-    stride_al_b,
-    stride_al_d,
-    y_ptr,
-    stride_y_e,
-    stride_y_h,
-    stride_y_m,
-    stride_y_b,
-    stride_y_d,
-    cl_ptr,
-    stride_cl_e,
-    stride_cl_h,
-    stride_cl_m,
-    stride_cl_b,
-    mask_ptr,
-    stride_mask_e,
-    stride_mask_m,
-    stride_mask_b,
-    sm_scale: float,
-    HAS_ATTN_MASK: tl.constexpr,
-    BLOCK_B: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    PRE_PAD: tl.constexpr,
-    EPS: tl.constexpr,
-    H: tl.constexpr,
-    M: tl.constexpr,
-    B: tl.constexpr,
-    D: tl.constexpr,
-    N: tl.constexpr,
-):
-    # 2D grid: (E*H, M) for better workload distribution
-    idx_eh = tl.program_id(0)
-    idx_m = tl.program_id(1)
-    idx_e = idx_eh // H
-    idx_h = idx_eh % H
-
-    # Pre-compute constants
-    pad_offset = M * B - N if PRE_PAD else 0
-    block_start_n = B * idx_m
-
-    range_b = tl.arange(0, BLOCK_B)
-    range_d = tl.arange(0, BLOCK_D)
-
-    # Simplified masks
-    mask_b = range_b < B
-    mask_d = range_d < D
-
-    # k_mask_b: valid key positions within actual sequence
-    if PRE_PAD:
-        k_mask_b = mask_b & ((block_start_n + range_b) >= pad_offset)
-    else:
-        k_mask_b = mask_b & ((block_start_n + range_b) < N)
-
-    if HAS_ATTN_MASK:
-        mask_block_ptr = (
-            mask_ptr
-            + stride_mask_e * idx_e
-            + stride_mask_m * idx_m
-            + stride_mask_b * (range_b - pad_offset)
-        )
-        valid_token_mask = tl.load(
-            mask_block_ptr,
-            mask=k_mask_b,
-            other=0,
-        )
-        k_mask_b = k_mask_b & valid_token_mask
-
-    # Load ar
-    ar_block_ptr = (
-        ar_ptr
-        + stride_ar_e * idx_e
-        + stride_ar_h * idx_h
-        + stride_ar_m * idx_m
-        + (stride_ar_b * range_b[:, None] + stride_ar_d * range_d[None, :])
-    )
-    ar = tl.load(
-        ar_block_ptr,
-        mask=mask_b[:, None] & mask_d[None, :],
-        other=0.0,
-    )
-
-    # Load k
-    k_block_ptr = (
-        k_ptr
-        + stride_k_e * idx_e
-        + stride_k_h * idx_h
-        + stride_k_m * idx_m
-        + (stride_k_b * (range_b - pad_offset)[:, None] + stride_k_d * range_d[None, :])
-    )
-    k = tl.load(
-        k_block_ptr,
-        mask=k_mask_b[:, None] & mask_d[None, :],
-        other=0.0,
-    )
-
-    # Load cr
-    cr_block_ptr = (
-        cr_ptr
-        + stride_cr_e * idx_e
-        + stride_cr_h * idx_h
-        + stride_cr_m * idx_m
-        + (stride_cr_b * range_b)
-    )
-    cr = tl.load(cr_block_ptr, mask=mask_b, other=1.0)
-
-    # Attention matrix - use bf16 inputs for tensor cores, fp32 accumulator
-    ar_bf16 = ar.to(tl.bfloat16)
-    k_bf16 = k.to(tl.bfloat16)
-    r = sm_scale * tl.dot(ar_bf16, tl.trans(k_bf16), out_dtype=tl.float32)
-    r = r / (cr[:, None] + EPS)
-    r = r + tl.where(k_mask_b[None, :], 0.0, float("-inf"))
-    r = tl.exp(r - tl.clamp(tl.max(r, axis=1, keep_dims=True), EPS, float("inf")))
-    r = r / (tl.sum(r, axis=1, keep_dims=True) + EPS)
-
-    # Store cl
-    cl = tl.sum(xlogx(r), axis=1)
-    cl_block_ptr = (
-        cl_ptr
-        + stride_cl_e * idx_e
-        + stride_cl_h * idx_h
-        + stride_cl_m * idx_m
-        + (stride_cl_b * range_b)
-    )
-    tl.store(cl_block_ptr, cl, mask=mask_b)
-
-    # Store al - use bf16 for tensor cores, cast back to input dtype
-    al = (sm_scale * tl.dot(r.to(tl.bfloat16), k_bf16, out_dtype=tl.float32)).to(ar.dtype)
-    al_block_ptr = (
-        al_ptr
-        + stride_al_e * idx_e
-        + stride_al_h * idx_h
-        + stride_al_m * idx_m
-        + (stride_al_b * range_b[:, None] + stride_al_d * range_d[None, :])
-    )
-    tl.store(
-        al_block_ptr,
-        al,
-        mask=mask_b[:, None] & mask_d[None, :],
-    )
-
-    # Load v
-    v_block_ptr = (
-        v_ptr
-        + stride_v_e * idx_e
-        + stride_v_h * idx_h
-        + stride_v_m * idx_m
-        + (stride_v_b * (range_b - pad_offset)[:, None] + stride_v_d * range_d[None, :])
-    )
-    v = tl.load(
-        v_block_ptr,
-        mask=k_mask_b[:, None] & mask_d[None, :],
-        other=0.0,
-    )
-
-    # Store y - use bf16 for tensor cores, cast back to input dtype
-    v_bf16 = v.to(tl.bfloat16)
-    y = tl.dot(r.to(tl.bfloat16), v_bf16, out_dtype=tl.float32).to(ar.dtype)
-    y_block_ptr = (
-        y_ptr
-        + stride_y_e * idx_e
-        + stride_y_h * idx_h
-        + stride_y_m * idx_m
-        + (stride_y_b * range_b[:, None] + stride_y_d * range_d[None, :])
-    )
-    tl.store(
-        y_block_ptr,
-        y,
-        mask=mask_b[:, None] & mask_d[None, :],
-    )
-
-
-@triton.autotune(configs=_get_tiled_b_autotune_configs(), key=['B', 'D'])
-@triton.jit
-def _al_y_cl_kernel_tiled(
-    ar_ptr,
-    stride_ar_e,
-    stride_ar_h,
-    stride_ar_m,
-    stride_ar_b,
-    stride_ar_d,
-    k_ptr,
-    stride_k_e,
-    stride_k_h,
-    stride_k_m,
-    stride_k_b,
-    stride_k_d,
-    v_ptr,
-    stride_v_e,
-    stride_v_h,
-    stride_v_m,
-    stride_v_b,
-    stride_v_d,
-    cr_ptr,
-    stride_cr_e,
-    stride_cr_h,
-    stride_cr_m,
-    stride_cr_b,
-    al_ptr,
-    stride_al_e,
-    stride_al_h,
-    stride_al_m,
-    stride_al_b,
-    stride_al_d,
-    y_ptr,
-    stride_y_e,
-    stride_y_h,
-    stride_y_m,
-    stride_y_b,
-    stride_y_d,
-    cl_ptr,
-    stride_cl_e,
-    stride_cl_h,
-    stride_cl_m,
-    stride_cl_b,
-    mask_ptr,
-    stride_mask_e,
-    stride_mask_m,
-    stride_mask_b,
-    sm_scale: float,
-    HAS_ATTN_MASK: tl.constexpr,
-    TILE_B: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    PRE_PAD: tl.constexpr,
-    EPS: tl.constexpr,
-    H: tl.constexpr,
-    M: tl.constexpr,
-    B: tl.constexpr,
-    D: tl.constexpr,
-    N: tl.constexpr,
-):
-    """Tiled version of _al_y_cl_kernel for large B (>128).
-
-    Uses online softmax to tile over key positions, also accumulates y = r @ v.
-    Grid: (E*H, M, cdiv(B, TILE_B))
-    """
-    idx_eh = tl.program_id(0)
-    idx_m = tl.program_id(1)
-    idx_q_tile = tl.program_id(2)
-    idx_e = idx_eh // H
-    idx_h = idx_eh % H
-
-    pad_offset = M * B - N if PRE_PAD else 0
-    block_start_n = B * idx_m
-
-    # Query tile range
-    q_start = idx_q_tile * TILE_B
-    range_q = q_start + tl.arange(0, TILE_B)
-    range_d = tl.arange(0, BLOCK_D)
-    mask_q = range_q < B
-    mask_d = range_d < D
-
-    # Load ar (query rows for this tile) - always from ar tensor (not q)
-    ar_base = ar_ptr + stride_ar_e * idx_e + stride_ar_h * idx_h + stride_ar_m * idx_m
-    ar_offset = stride_ar_b * range_q[:, None] + range_d[None, :]
-    ar = tl.load(ar_base + ar_offset, mask=mask_q[:, None] & mask_d[None, :], other=0.0)
-    ar_bf16 = ar.to(tl.bfloat16)
-
-    # Load cr for query tile
-    cr_base = cr_ptr + stride_cr_e * idx_e + stride_cr_h * idx_h + stride_cr_m * idx_m
-    cr = tl.load(cr_base + stride_cr_b * range_q, mask=mask_q, other=1.0)
-
-    # Online softmax accumulators
-    max_rows = tl.full([TILE_B], float('-inf'), dtype=tl.float32)
-    sum_rows = tl.zeros([TILE_B], dtype=tl.float32)
-    al_acc = tl.zeros([TILE_B, BLOCK_D], dtype=tl.float32)
-    y_acc = tl.zeros([TILE_B, BLOCK_D], dtype=tl.float32)
-    score_acc = tl.zeros([TILE_B], dtype=tl.float32)
-
-    # Loop over key/value tiles
-    k_base = k_ptr + stride_k_e * idx_e + stride_k_h * idx_h + stride_k_m * idx_m
-    v_base = v_ptr + stride_v_e * idx_e + stride_v_h * idx_h + stride_v_m * idx_m
-    range_k = tl.arange(0, TILE_B)
-
-    for k_start in tl.range(0, B, TILE_B, num_stages=3):
-        k_range = k_start + range_k
-        k_mask = k_range < B
-        if PRE_PAD:
-            k_valid = k_mask & ((block_start_n + k_range) >= pad_offset)
-        else:
-            k_valid = k_mask & ((block_start_n + k_range) < N)
-
-        if HAS_ATTN_MASK:
-            mask_block_ptr = (
-                mask_ptr + stride_mask_e * idx_e + stride_mask_m * idx_m
-                + stride_mask_b * (k_range - pad_offset)
-            )
-            valid_token_mask = tl.load(mask_block_ptr, mask=k_valid, other=0)
-            k_valid = k_valid & valid_token_mask
-
-        # Load key tile [TILE_B, D]
-        k_offset = stride_k_b * (k_range - pad_offset)[:, None] + range_d[None, :]
-        k_tile = tl.load(k_base + k_offset, mask=k_valid[:, None] & mask_d[None, :], other=0.0)
-        k_bf16 = k_tile.to(tl.bfloat16)
-
-        # Load value tile [TILE_B, D]
-        v_offset = stride_v_b * (k_range - pad_offset)[:, None] + range_d[None, :]
-        v_tile = tl.load(v_base + v_offset, mask=k_valid[:, None] & mask_d[None, :], other=0.0)
-        v_bf16 = v_tile.to(tl.bfloat16)
-
-        # Scores [TILE_B_q, TILE_B_k]
-        scores = sm_scale * tl.dot(ar_bf16, tl.trans(k_bf16), out_dtype=tl.float32)
-        scores = scores / (cr[:, None] + EPS)
-        scores = scores + tl.where(k_valid[None, :], 0.0, float("-inf"))
-
-        # Online softmax update
-        tile_max = tl.max(scores, axis=1)
-        new_max = tl.maximum(max_rows, tile_max)
-        scale = tl.exp(max_rows - new_max)
-
-        al_acc = al_acc * scale[:, None]
-        y_acc = y_acc * scale[:, None]
-        sum_rows = sum_rows * scale
-        score_acc = score_acc * scale
-
-        exp_scores = tl.exp(scores - new_max[:, None])
-        al_acc = al_acc + tl.dot(exp_scores.to(tl.bfloat16), k_bf16, out_dtype=tl.float32)
-        y_acc = y_acc + tl.dot(exp_scores.to(tl.bfloat16), v_bf16, out_dtype=tl.float32)
-        score_acc = score_acc + tl.sum(exp_scores * scores, axis=1)
-        sum_rows = sum_rows + tl.sum(exp_scores, axis=1)
-        max_rows = new_max
-
-    # Finalize outputs
-    safe_sum = tl.where(sum_rows > 0, sum_rows, 1.0)
-    al = (sm_scale * al_acc / safe_sum[:, None]).to(ar.dtype)
-    y = (y_acc / safe_sum[:, None]).to(ar.dtype)
-    cl = tl.where(sum_rows > 0, score_acc / safe_sum - max_rows - tl.log(safe_sum), 0.0)
-
-    # Store al
-    al_base = al_ptr + stride_al_e * idx_e + stride_al_h * idx_h + stride_al_m * idx_m
-    al_offset = stride_al_b * range_q[:, None] + range_d[None, :]
-    tl.store(al_base + al_offset, al, mask=mask_q[:, None] & mask_d[None, :])
-
-    # Store y
-    y_base = y_ptr + stride_y_e * idx_e + stride_y_h * idx_h + stride_y_m * idx_m
-    y_offset = stride_y_b * range_q[:, None] + range_d[None, :]
-    tl.store(y_base + y_offset, y, mask=mask_q[:, None] & mask_d[None, :])
-
-    # Store cl
-    cl_base = cl_ptr + stride_cl_e * idx_e + stride_cl_h * idx_h + stride_cl_m * idx_m
-    tl.store(cl_base + stride_cl_b * range_q, cl, mask=mask_q)
 
 
 @triton.jit
@@ -919,43 +573,21 @@ def _z_kernel(
     else:
         q_mask_m = mask_m & ((idx_b + B * range_m) < N)
 
+    # Pre-compute base pointers
+    al_base = al_ptr + stride_al_e * idx_e + stride_al_h * idx_h + stride_al_b * idx_b
+    q_base = q_ptr + stride_q_e * idx_e + stride_q_h * idx_h + stride_q_b * (idx_b - pad_offset)
+    cl_base = cl_ptr + stride_cl_e * idx_e + stride_cl_h * idx_h + stride_cl_b * idx_b
+
     # Load al
-    al_block_ptr = (
-        al_ptr
-        + stride_al_e * idx_e
-        + stride_al_h * idx_h
-        + stride_al_b * idx_b
-        + (stride_al_m * range_m[:, None] + stride_al_d * range_d[None, :])
-    )
-    al = tl.load(
-        al_block_ptr,
-        mask=mask_m[:, None] & mask_d[None, :],
-        other=0.0,
-    )
+    al_offset = stride_al_m * range_m[:, None] + stride_al_d * range_d[None, :]
+    al = tl.load(al_base + al_offset, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
 
     # Load q
-    q_block_ptr = (
-        q_ptr
-        + stride_q_e * idx_e
-        + stride_q_h * idx_h
-        + stride_q_b * (idx_b - pad_offset)
-        + (stride_q_m * range_m[:, None] + stride_q_d * range_d[None, :])
-    )
-    q = tl.load(
-        q_block_ptr,
-        mask=q_mask_m[:, None] & mask_d[None, :],
-        other=0.0,
-    )
+    q_offset = stride_q_m * range_m[:, None] + stride_q_d * range_d[None, :]
+    q = tl.load(q_base + q_offset, mask=q_mask_m[:, None] & mask_d[None, :], other=0.0)
 
     # Load cl
-    cl_block_ptr = (
-        cl_ptr
-        + stride_cl_e * idx_e
-        + stride_cl_h * idx_h
-        + stride_cl_b * idx_b
-        + (stride_cl_m * range_m)
-    )
-    cl = tl.load(cl_block_ptr, mask=mask_m, other=0.0)
+    cl = tl.load(cl_base + stride_cl_m * range_m, mask=mask_m, other=0.0)
 
     # Attention matrix - use bf16 inputs for tensor cores, fp32 accumulator
     q_bf16 = q.to(tl.bfloat16)
@@ -967,34 +599,16 @@ def _z_kernel(
     l = l / tl.sum(l, axis=1, keep_dims=True)
 
     # Load y
-    y_block_ptr = (
-        y_ptr
-        + stride_y_e * idx_e
-        + stride_y_h * idx_h
-        + stride_y_b * idx_b
-        + (stride_y_m * range_m[:, None] + stride_y_d * range_d[None, :])
-    )
-    y = tl.load(
-        y_block_ptr,
-        mask=mask_m[:, None] & mask_d[None, :],
-        other=0.0,
-    )
+    y_base = y_ptr + stride_y_e * idx_e + stride_y_h * idx_h + stride_y_b * idx_b
+    y_offset = stride_y_m * range_m[:, None] + stride_y_d * range_d[None, :]
+    y = tl.load(y_base + y_offset, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
 
     # Store z - use bf16 for tensor cores, cast back to input dtype
     y_bf16 = y.to(tl.bfloat16)
     z = tl.dot(l.to(tl.bfloat16), y_bf16, out_dtype=tl.float32).to(al.dtype)
-    z_block_ptr = (
-        z_ptr
-        + stride_z_e * idx_e
-        + stride_z_h * idx_h
-        + stride_z_b * (idx_b - pad_offset)
-        + (stride_z_m * range_m[:, None] + stride_z_d * range_d[None, :])
-    )
-    tl.store(
-        z_block_ptr,
-        z,
-        mask=q_mask_m[:, None] & mask_d[None, :],
-    )
+    z_base = z_ptr + stride_z_e * idx_e + stride_z_h * idx_h + stride_z_b * (idx_b - pad_offset)
+    z_offset = stride_z_m * range_m[:, None] + stride_z_d * range_d[None, :]
+    tl.store(z_base + z_offset, z, mask=q_mask_m[:, None] & mask_d[None, :])
 
 
 # =============================================================================
@@ -1042,13 +656,14 @@ def _ar_cr_softmax_stats_kernel(
     else:
         q_mask_j = j_mask & ((idx_b + B * j_range) < N)
 
+    # Pre-compute base pointers
+    q_base = q_ptr + stride_q_e * idx_e + stride_q_h * idx_h + stride_q_b * (idx_b - pad_offset)
+    al_base = al_ptr + stride_al_e * idx_e + stride_al_h * idx_h + stride_al_b * idx_b
+    cl_base = cl_ptr + stride_cl_e * idx_e + stride_cl_h * idx_h + stride_cl_b * idx_b
+
     # Load q_tile [TILE_M, D] - the "key" positions for this column tile
-    q_block_ptr = (
-        q_ptr + stride_q_e * idx_e + stride_q_h * idx_h
-        + stride_q_b * (idx_b - pad_offset)
-        + (stride_q_m * j_range[:, None] + stride_q_d * range_d[None, :])
-    )
-    q_tile = tl.load(q_block_ptr, mask=q_mask_j[:, None] & mask_d[None, :], other=0.0)
+    q_offset = stride_q_m * j_range[:, None] + stride_q_d * range_d[None, :]
+    q_tile = tl.load(q_base + q_offset, mask=q_mask_j[:, None] & mask_d[None, :], other=0.0)
     q_bf16 = q_tile.to(tl.bfloat16)
 
     # Initialize online softmax accumulators for each column
@@ -1062,19 +677,11 @@ def _ar_cr_softmax_stats_kernel(
         i_mask = i_range < M
 
         # Load al_tile [TILE_M, D]
-        al_block_ptr = (
-            al_ptr + stride_al_e * idx_e + stride_al_h * idx_h
-            + stride_al_b * idx_b
-            + (stride_al_m * i_range[:, None] + stride_al_d * range_d[None, :])
-        )
-        al_tile = tl.load(al_block_ptr, mask=i_mask[:, None] & mask_d[None, :], other=0.0)
+        al_offset = stride_al_m * i_range[:, None] + stride_al_d * range_d[None, :]
+        al_tile = tl.load(al_base + al_offset, mask=i_mask[:, None] & mask_d[None, :], other=0.0)
 
         # Load cl_tile [TILE_M]
-        cl_block_ptr = (
-            cl_ptr + stride_cl_e * idx_e + stride_cl_h * idx_h
-            + stride_cl_b * idx_b + stride_cl_m * i_range
-        )
-        cl_tile = tl.load(cl_block_ptr, mask=i_mask, other=0.0)
+        cl_tile = tl.load(cl_base + stride_cl_m * i_range, mask=i_mask, other=0.0)
 
         # Compute attention scores [TILE_M_i, TILE_M_j]
         al_bf16 = al_tile.to(tl.bfloat16)
@@ -1100,17 +707,11 @@ def _ar_cr_softmax_stats_kernel(
     out_range = j_start + tl.arange(0, TILE_M)
     out_mask = out_range < M
 
-    max_block_ptr = (
-        max_ptr + stride_max_e * idx_e + stride_max_h * idx_h
-        + stride_max_b * idx_b + stride_max_m * out_range
-    )
-    tl.store(max_block_ptr, max_cols, mask=out_mask)
+    max_base = max_ptr + stride_max_e * idx_e + stride_max_h * idx_h + stride_max_b * idx_b
+    tl.store(max_base + stride_max_m * out_range, max_cols, mask=out_mask)
 
-    sum_block_ptr = (
-        sum_ptr + stride_sum_e * idx_e + stride_sum_h * idx_h
-        + stride_sum_b * idx_b + stride_sum_m * out_range
-    )
-    tl.store(sum_block_ptr, sum_cols, mask=out_mask)
+    sum_base = sum_ptr + stride_sum_e * idx_e + stride_sum_h * idx_h + stride_sum_b * idx_b
+    tl.store(sum_base + stride_sum_m * out_range, sum_cols, mask=out_mask)
 
 
 @triton.autotune(configs=_get_warp_stage_autotune_configs(), key=['M', 'D'])
@@ -1146,21 +747,20 @@ def _ar_cr_accumulate_kernel(
     range_d = tl.arange(0, BLOCK_D)
     mask_d = range_d < D
 
+    # Pre-compute base pointers
+    al_base = al_ptr + stride_al_e * idx_e + stride_al_h * idx_h + stride_al_b * idx_b
+    cl_base = cl_ptr + stride_cl_e * idx_e + stride_cl_h * idx_h + stride_cl_b * idx_b
+    q_base = q_ptr + stride_q_e * idx_e + stride_q_h * idx_h + stride_q_b * (idx_b - pad_offset)
+    max_base = max_ptr + stride_max_e * idx_e + stride_max_h * idx_h + stride_max_b * idx_b
+    sum_base = sum_ptr + stride_sum_e * idx_e + stride_sum_h * idx_h + stride_sum_b * idx_b
+
     # Load al_tile [TILE_M, D] - this tile's rows
-    al_block_ptr = (
-        al_ptr + stride_al_e * idx_e + stride_al_h * idx_h
-        + stride_al_b * idx_b
-        + (stride_al_m * i_range[:, None] + stride_al_d * range_d[None, :])
-    )
-    al_tile = tl.load(al_block_ptr, mask=i_mask[:, None] & mask_d[None, :], other=0.0)
+    al_offset = stride_al_m * i_range[:, None] + stride_al_d * range_d[None, :]
+    al_tile = tl.load(al_base + al_offset, mask=i_mask[:, None] & mask_d[None, :], other=0.0)
     al_bf16 = al_tile.to(tl.bfloat16)
 
     # Load cl_tile [TILE_M]
-    cl_block_ptr = (
-        cl_ptr + stride_cl_e * idx_e + stride_cl_h * idx_h
-        + stride_cl_b * idx_b + stride_cl_m * i_range
-    )
-    cl_tile = tl.load(cl_block_ptr, mask=i_mask, other=0.0)
+    cl_tile = tl.load(cl_base + stride_cl_m * i_range, mask=i_mask, other=0.0)
 
     # Initialize accumulators
     ar_acc = tl.zeros([TILE_M, BLOCK_D], dtype=tl.float32)
@@ -1178,26 +778,13 @@ def _ar_cr_accumulate_kernel(
             q_mask_j = j_mask & ((idx_b + B * j_range) < N)
 
         # Load q_tile [TILE_M, D]
-        q_block_ptr = (
-            q_ptr + stride_q_e * idx_e + stride_q_h * idx_h
-            + stride_q_b * (idx_b - pad_offset)
-            + (stride_q_m * j_range[:, None] + stride_q_d * range_d[None, :])
-        )
-        q_tile = tl.load(q_block_ptr, mask=q_mask_j[:, None] & mask_d[None, :], other=0.0)
+        q_offset = stride_q_m * j_range[:, None] + stride_q_d * range_d[None, :]
+        q_tile = tl.load(q_base + q_offset, mask=q_mask_j[:, None] & mask_d[None, :], other=0.0)
         q_bf16 = q_tile.to(tl.bfloat16)
 
         # Load precomputed max and sum for these columns
-        max_block_ptr = (
-            max_ptr + stride_max_e * idx_e + stride_max_h * idx_h
-            + stride_max_b * idx_b + stride_max_m * j_range
-        )
-        max_cols = tl.load(max_block_ptr, mask=j_mask, other=0.0)
-
-        sum_block_ptr = (
-            sum_ptr + stride_sum_e * idx_e + stride_sum_h * idx_h
-            + stride_sum_b * idx_b + stride_sum_m * j_range
-        )
-        sum_cols = tl.load(sum_block_ptr, mask=j_mask, other=1.0)  # Avoid div by zero
+        max_cols = tl.load(max_base + stride_max_m * j_range, mask=j_mask, other=0.0)
+        sum_cols = tl.load(sum_base + stride_sum_m * j_range, mask=j_mask, other=1.0)  # Avoid div by zero
 
         # Compute attention scores [TILE_M, TILE_M]
         scores = tl.dot(al_bf16, tl.trans(q_bf16), out_dtype=tl.float32)
@@ -1213,231 +800,14 @@ def _ar_cr_accumulate_kernel(
         cr_acc = cr_acc + tl.sum(l_tile, axis=1)
 
     # Store results
-    ar_block_ptr = (
-        ar_ptr + stride_ar_e * idx_e + stride_ar_h * idx_h
-        + stride_ar_b * idx_b
-        + (stride_ar_m * i_range[:, None] + stride_ar_d * range_d[None, :])
-    )
-    tl.store(ar_block_ptr, ar_acc.to(al_tile.dtype), mask=i_mask[:, None] & mask_d[None, :])
+    ar_base = ar_ptr + stride_ar_e * idx_e + stride_ar_h * idx_h + stride_ar_b * idx_b
+    ar_offset = stride_ar_m * i_range[:, None] + stride_ar_d * range_d[None, :]
+    tl.store(ar_base + ar_offset, ar_acc.to(al_tile.dtype), mask=i_mask[:, None] & mask_d[None, :])
 
-    cr_block_ptr = (
-        cr_ptr + stride_cr_e * idx_e + stride_cr_h * idx_h
-        + stride_cr_b * idx_b + stride_cr_m * i_range
-    )
-    tl.store(cr_block_ptr, cr_acc, mask=i_mask)
+    cr_base = cr_ptr + stride_cr_e * idx_e + stride_cr_h * idx_h + stride_cr_b * idx_b
+    tl.store(cr_base + stride_cr_m * i_range, cr_acc, mask=i_mask)
 
 
-@triton.jit
-def _ar_cr_softmax_stats_kernel_tma(
-    al_ptr, stride_al_e, stride_al_h, stride_al_m, stride_al_b, stride_al_d,
-    q_ptr, stride_q_e, stride_q_h, stride_q_m, stride_q_b, stride_q_d,
-    cl_ptr, stride_cl_e, stride_cl_h, stride_cl_m, stride_cl_b,
-    max_ptr, stride_max_e, stride_max_h, stride_max_m, stride_max_b,
-    sum_ptr, stride_sum_e, stride_sum_h, stride_sum_m, stride_sum_b,
-    TILE_M: tl.constexpr, BLOCK_D: tl.constexpr, PRE_PAD: tl.constexpr,
-    H: tl.constexpr, M: tl.constexpr, B: tl.constexpr, D: tl.constexpr, N: tl.constexpr,
-):
-    """TMA-optimized Phase 1: Compute softmax max and sum with pipelining."""
-    idx_eh = tl.program_id(0)
-    idx_b = tl.program_id(1)
-    idx_j_tile = tl.program_id(2)
-    idx_e = idx_eh // H
-    idx_h = idx_eh % H
-
-    pad_offset = M * B - N if PRE_PAD else 0
-
-    # Column indices for this tile
-    j_start = idx_j_tile * TILE_M
-    j_range = j_start + tl.arange(0, TILE_M)
-    j_mask = j_range < M
-
-    range_d = tl.arange(0, BLOCK_D)
-    mask_d = range_d < D
-
-    if PRE_PAD:
-        q_mask_j = j_mask & ((idx_b + B * j_range) >= pad_offset)
-    else:
-        q_mask_j = j_mask & ((idx_b + B * j_range) < N)
-
-    # Load q_tile (only once)
-    q_block_ptr = (
-        q_ptr + stride_q_e * idx_e + stride_q_h * idx_h
-        + stride_q_b * (idx_b - pad_offset)
-        + (stride_q_m * j_range[:, None] + stride_q_d * range_d[None, :])
-    )
-    q_tile = tl.load(q_block_ptr, mask=q_mask_j[:, None] & mask_d[None, :], other=0.0)
-    q_bf16 = q_tile.to(tl.bfloat16)
-
-    # Base pointers for TMA
-    al_base = al_ptr + stride_al_e * idx_e + stride_al_h * idx_h + stride_al_b * idx_b
-    cl_base = cl_ptr + stride_cl_e * idx_e + stride_cl_h * idx_h + stride_cl_b * idx_b
-
-    # Create TMA descriptor for al
-    al_desc = tl.make_tensor_descriptor(
-        al_base,
-        shape=[M, D],
-        strides=[stride_al_m, stride_al_d],
-        block_shape=[TILE_M, BLOCK_D],
-    )
-
-    # Initialize accumulators
-    max_cols = tl.full([TILE_M], float('-inf'), dtype=tl.float32)
-    sum_cols = tl.zeros([TILE_M], dtype=tl.float32)
-
-    num_tiles = tl.cdiv(M, TILE_M)
-    range_i = tl.arange(0, TILE_M)
-
-    # Prefetch first tile
-    al_next = al_desc.load([0, 0])
-    cl_next = tl.load(cl_base + stride_cl_m * range_i, mask=range_i < M, other=0.0)
-
-    # Main loop with pipelining
-    for tile_idx in range(num_tiles):
-        i_start = tile_idx * TILE_M
-        i_range = i_start + range_i
-        i_mask = i_range < M
-
-        al_tile = al_next
-        cl_tile = cl_next
-
-        # Prefetch next
-        next_tile_idx = tile_idx + 1
-        if next_tile_idx < num_tiles:
-            next_i_start = next_tile_idx * TILE_M
-            al_next = al_desc.load([next_i_start, 0])
-            next_i_range = next_i_start + range_i
-            cl_next = tl.load(cl_base + stride_cl_m * next_i_range, mask=next_i_range < M, other=0.0)
-
-        # Compute scores
-        al_bf16 = al_tile.to(tl.bfloat16)
-        scores = tl.dot(al_bf16, tl.trans(q_bf16), out_dtype=tl.float32)
-        scores = scores - cl_tile[:, None]
-        scores = tl.where(i_mask[:, None], scores, float('-inf'))
-
-        # Online softmax update
-        tile_max = tl.max(scores, axis=0)
-        new_max = tl.maximum(max_cols, tile_max)
-        scale = tl.exp(max_cols - new_max)
-        sum_cols = sum_cols * scale
-        exp_scores = tl.exp(scores - new_max[None, :])
-        sum_cols = sum_cols + tl.sum(exp_scores, axis=0)
-        max_cols = new_max
-
-    # Store results
-    out_range = j_start + tl.arange(0, TILE_M)
-    out_mask = out_range < M
-    max_block_ptr = max_ptr + stride_max_e * idx_e + stride_max_h * idx_h + stride_max_b * idx_b + stride_max_m * out_range
-    tl.store(max_block_ptr, max_cols, mask=out_mask)
-    sum_block_ptr = sum_ptr + stride_sum_e * idx_e + stride_sum_h * idx_h + stride_sum_b * idx_b + stride_sum_m * out_range
-    tl.store(sum_block_ptr, sum_cols, mask=out_mask)
-
-
-@triton.jit
-def _ar_cr_accumulate_kernel_tma(
-    al_ptr, stride_al_e, stride_al_h, stride_al_m, stride_al_b, stride_al_d,
-    q_ptr, stride_q_e, stride_q_h, stride_q_m, stride_q_b, stride_q_d,
-    cl_ptr, stride_cl_e, stride_cl_h, stride_cl_m, stride_cl_b,
-    max_ptr, stride_max_e, stride_max_h, stride_max_m, stride_max_b,
-    sum_ptr, stride_sum_e, stride_sum_h, stride_sum_m, stride_sum_b,
-    ar_ptr, stride_ar_e, stride_ar_h, stride_ar_m, stride_ar_b, stride_ar_d,
-    cr_ptr, stride_cr_e, stride_cr_h, stride_cr_m, stride_cr_b,
-    TILE_M: tl.constexpr, BLOCK_D: tl.constexpr, PRE_PAD: tl.constexpr,
-    H: tl.constexpr, M: tl.constexpr, B: tl.constexpr, D: tl.constexpr, N: tl.constexpr,
-):
-    """TMA-optimized Phase 2: Compute ar and cr with pipelining."""
-    idx_eh = tl.program_id(0)
-    idx_b = tl.program_id(1)
-    idx_i_tile = tl.program_id(2)
-    idx_e = idx_eh // H
-    idx_h = idx_eh % H
-
-    pad_offset = M * B - N if PRE_PAD else 0
-
-    # Row indices for this output tile
-    i_start = idx_i_tile * TILE_M
-    i_range = i_start + tl.arange(0, TILE_M)
-    i_mask = i_range < M
-
-    range_d = tl.arange(0, BLOCK_D)
-    mask_d = range_d < D
-
-    # Base pointers
-    al_base = al_ptr + stride_al_e * idx_e + stride_al_h * idx_h + stride_al_b * idx_b
-    cl_base = cl_ptr + stride_cl_e * idx_e + stride_cl_h * idx_h + stride_cl_b * idx_b
-    max_base = max_ptr + stride_max_e * idx_e + stride_max_h * idx_h + stride_max_b * idx_b
-    sum_base = sum_ptr + stride_sum_e * idx_e + stride_sum_h * idx_h + stride_sum_b * idx_b
-
-    # Load this tile's al and cl (constant across j iterations)
-    al_block_ptr = al_base + (stride_al_m * i_range[:, None] + stride_al_d * range_d[None, :])
-    al_tile = tl.load(al_block_ptr, mask=i_mask[:, None] & mask_d[None, :], other=0.0)
-    al_bf16 = al_tile.to(tl.bfloat16)
-    cl_tile = tl.load(cl_base + stride_cl_m * i_range, mask=i_mask, other=0.0)
-
-    # TMA descriptor for q
-    q_base = q_ptr + stride_q_e * idx_e + stride_q_h * idx_h + stride_q_b * (idx_b - pad_offset)
-    q_desc = tl.make_tensor_descriptor(
-        q_base,
-        shape=[M, D],
-        strides=[stride_q_m, stride_q_d],
-        block_shape=[TILE_M, BLOCK_D],
-    )
-
-    # Initialize accumulators
-    ar_acc = tl.zeros([TILE_M, BLOCK_D], dtype=tl.float32)
-    cr_acc = tl.zeros([TILE_M], dtype=tl.float32)
-
-    num_tiles = tl.cdiv(M, TILE_M)
-    range_j = tl.arange(0, TILE_M)
-
-    # Prefetch first tile
-    q_next = q_desc.load([0, 0])
-    max_next = tl.load(max_base + stride_max_m * range_j, mask=range_j < M, other=0.0)
-    sum_next = tl.load(sum_base + stride_sum_m * range_j, mask=range_j < M, other=1.0)
-
-    # Main loop with pipelining
-    for tile_idx in range(num_tiles):
-        j_start = tile_idx * TILE_M
-        j_range = j_start + range_j
-        j_mask = j_range < M
-
-        if PRE_PAD:
-            q_mask_j = j_mask & ((idx_b + B * j_range) >= pad_offset)
-        else:
-            q_mask_j = j_mask & ((idx_b + B * j_range) < N)
-
-        q_tile = q_next
-        max_cols = max_next
-        sum_cols = sum_next
-
-        # Prefetch next
-        next_tile_idx = tile_idx + 1
-        if next_tile_idx < num_tiles:
-            next_j_start = next_tile_idx * TILE_M
-            q_next = q_desc.load([next_j_start, 0])
-            next_j_range = next_j_start + range_j
-            max_next = tl.load(max_base + stride_max_m * next_j_range, mask=next_j_range < M, other=0.0)
-            sum_next = tl.load(sum_base + stride_sum_m * next_j_range, mask=next_j_range < M, other=1.0)
-
-        # Compute scores
-        q_bf16 = q_tile.to(tl.bfloat16)
-        scores = tl.dot(al_bf16, tl.trans(q_bf16), out_dtype=tl.float32)
-        scores = scores - cl_tile[:, None]
-
-        # Normalize
-        l_tile = tl.exp(scores - max_cols[None, :]) / sum_cols[None, :]
-        l_tile = tl.where(j_mask[None, :], l_tile, 0.0)
-        l_tile = tl.where(q_mask_j[None, :], l_tile, 0.0)
-
-        # Accumulate
-        ar_acc = ar_acc + tl.dot(l_tile.to(tl.bfloat16), q_bf16, out_dtype=tl.float32)
-        cr_acc = cr_acc + tl.sum(l_tile, axis=1)
-
-    # Store results
-    ar_block_ptr = (ar_ptr + stride_ar_e * idx_e + stride_ar_h * idx_h + stride_ar_b * idx_b
-                    + (stride_ar_m * i_range[:, None] + stride_ar_d * range_d[None, :]))
-    tl.store(ar_block_ptr, ar_acc.to(al_tile.dtype), mask=i_mask[:, None] & mask_d[None, :])
-    cr_block_ptr = cr_ptr + stride_cr_e * idx_e + stride_cr_h * idx_h + stride_cr_b * idx_b + stride_cr_m * i_range
-    tl.store(cr_block_ptr, cr_acc, mask=i_mask)
 
 
 @triton.autotune(configs=_get_tiled_m_autotune_configs(), key=['M', 'D'])
@@ -1479,13 +849,15 @@ def _z_kernel_tiled(
     else:
         q_mask_i = i_mask & ((idx_b + B * i_range) < N)
 
+    # Pre-compute base pointers
+    q_base = q_ptr + stride_q_e * idx_e + stride_q_h * idx_h + stride_q_b * (idx_b - pad_offset)
+    al_base = al_ptr + stride_al_e * idx_e + stride_al_h * idx_h + stride_al_b * idx_b
+    cl_base = cl_ptr + stride_cl_e * idx_e + stride_cl_h * idx_h + stride_cl_b * idx_b
+    y_base = y_ptr + stride_y_e * idx_e + stride_y_h * idx_h + stride_y_b * idx_b
+
     # Load q_tile [TILE_M, D] - query positions for this output tile
-    q_block_ptr = (
-        q_ptr + stride_q_e * idx_e + stride_q_h * idx_h
-        + stride_q_b * (idx_b - pad_offset)
-        + (stride_q_m * i_range[:, None] + stride_q_d * range_d[None, :])
-    )
-    q_tile = tl.load(q_block_ptr, mask=q_mask_i[:, None] & mask_d[None, :], other=0.0)
+    q_offset = stride_q_m * i_range[:, None] + stride_q_d * range_d[None, :]
+    q_tile = tl.load(q_base + q_offset, mask=q_mask_i[:, None] & mask_d[None, :], other=0.0)
 
     # Initialize online softmax accumulators (per row)
     max_rows = tl.full([TILE_M], float('-inf'), dtype=tl.float32)
@@ -1499,27 +871,15 @@ def _z_kernel_tiled(
         j_mask = j_range < M
 
         # Load al_tile [TILE_M, D]
-        al_block_ptr = (
-            al_ptr + stride_al_e * idx_e + stride_al_h * idx_h
-            + stride_al_b * idx_b
-            + (stride_al_m * j_range[:, None] + stride_al_d * range_d[None, :])
-        )
-        al_tile = tl.load(al_block_ptr, mask=j_mask[:, None] & mask_d[None, :], other=0.0)
+        al_offset = stride_al_m * j_range[:, None] + stride_al_d * range_d[None, :]
+        al_tile = tl.load(al_base + al_offset, mask=j_mask[:, None] & mask_d[None, :], other=0.0)
 
         # Load cl_tile [TILE_M]
-        cl_block_ptr = (
-            cl_ptr + stride_cl_e * idx_e + stride_cl_h * idx_h
-            + stride_cl_b * idx_b + stride_cl_m * j_range
-        )
-        cl_tile = tl.load(cl_block_ptr, mask=j_mask, other=0.0)
+        cl_tile = tl.load(cl_base + stride_cl_m * j_range, mask=j_mask, other=0.0)
 
         # Load y_tile [TILE_M, D]
-        y_block_ptr = (
-            y_ptr + stride_y_e * idx_e + stride_y_h * idx_h
-            + stride_y_b * idx_b
-            + (stride_y_m * j_range[:, None] + stride_y_d * range_d[None, :])
-        )
-        y_tile = tl.load(y_block_ptr, mask=j_mask[:, None] & mask_d[None, :], other=0.0)
+        y_offset = stride_y_m * j_range[:, None] + stride_y_d * range_d[None, :]
+        y_tile = tl.load(y_base + y_offset, mask=j_mask[:, None] & mask_d[None, :], other=0.0)
 
         # Compute attention scores [TILE_M_i, TILE_M_j]
         q_bf16 = q_tile.to(tl.bfloat16)
@@ -1551,144 +911,10 @@ def _z_kernel_tiled(
     z = z_acc / sum_rows[:, None]
 
     # Store z
-    z_block_ptr = (
-        z_ptr + stride_z_e * idx_e + stride_z_h * idx_h
-        + stride_z_b * (idx_b - pad_offset)
-        + (stride_z_m * i_range[:, None] + stride_z_d * range_d[None, :])
-    )
-    tl.store(z_block_ptr, z.to(q_tile.dtype), mask=q_mask_i[:, None] & mask_d[None, :])
+    z_base = z_ptr + stride_z_e * idx_e + stride_z_h * idx_h + stride_z_b * (idx_b - pad_offset)
+    z_offset = stride_z_m * i_range[:, None] + stride_z_d * range_d[None, :]
+    tl.store(z_base + z_offset, z.to(q_tile.dtype), mask=q_mask_i[:, None] & mask_d[None, :])
 
-
-@triton.jit
-def _z_kernel_tiled_tma(
-    al_ptr, stride_al_e, stride_al_h, stride_al_m, stride_al_b, stride_al_d,
-    q_ptr, stride_q_e, stride_q_h, stride_q_m, stride_q_b, stride_q_d,
-    y_ptr, stride_y_e, stride_y_h, stride_y_m, stride_y_b, stride_y_d,
-    cl_ptr, stride_cl_e, stride_cl_h, stride_cl_m, stride_cl_b,
-    z_ptr, stride_z_e, stride_z_h, stride_z_m, stride_z_b, stride_z_d,
-    TILE_M: tl.constexpr, BLOCK_D: tl.constexpr, PRE_PAD: tl.constexpr,
-    H: tl.constexpr, M: tl.constexpr, B: tl.constexpr, D: tl.constexpr, N: tl.constexpr,
-):
-    """TMA-optimized tiled _z_kernel with software pipelining.
-
-    Uses TMA descriptors for bulk memory transfers and prefetches next tiles
-    while computing current tiles.
-    """
-    idx_eh = tl.program_id(0)
-    idx_b = tl.program_id(1)
-    idx_i_tile = tl.program_id(2)
-    idx_e = idx_eh // H
-    idx_h = idx_eh % H
-
-    pad_offset = M * B - N if PRE_PAD else 0
-
-    # Row indices for this tile (output rows)
-    i_start = idx_i_tile * TILE_M
-    i_range = i_start + tl.arange(0, TILE_M)
-    i_mask = i_range < M
-
-    range_d = tl.arange(0, BLOCK_D)
-    mask_d = range_d < D
-
-    if PRE_PAD:
-        q_mask_i = i_mask & ((idx_b + B * i_range) >= pad_offset)
-    else:
-        q_mask_i = i_mask & ((idx_b + B * i_range) < N)
-
-    # Base pointers for this (e, h, b) slice
-    al_base = al_ptr + stride_al_e * idx_e + stride_al_h * idx_h + stride_al_b * idx_b
-    y_base = y_ptr + stride_y_e * idx_e + stride_y_h * idx_h + stride_y_b * idx_b
-    cl_base = cl_ptr + stride_cl_e * idx_e + stride_cl_h * idx_h + stride_cl_b * idx_b
-
-    # Create TMA descriptors for al and y (2D tensors: [M, D])
-    # Note: TMA requires contiguous memory, so we work with [M, D] slices
-    al_desc = tl.make_tensor_descriptor(
-        al_base,
-        shape=[M, D],
-        strides=[stride_al_m, stride_al_d],
-        block_shape=[TILE_M, BLOCK_D],
-    )
-    y_desc = tl.make_tensor_descriptor(
-        y_base,
-        shape=[M, D],
-        strides=[stride_y_m, stride_y_d],
-        block_shape=[TILE_M, BLOCK_D],
-    )
-
-    # Load q_tile (only once, stays in registers)
-    q_block_ptr = (
-        q_ptr + stride_q_e * idx_e + stride_q_h * idx_h
-        + stride_q_b * (idx_b - pad_offset)
-        + (stride_q_m * i_range[:, None] + stride_q_d * range_d[None, :])
-    )
-    q_tile = tl.load(q_block_ptr, mask=q_mask_i[:, None] & mask_d[None, :], other=0.0)
-    q_bf16 = q_tile.to(tl.bfloat16)
-
-    # Initialize online softmax accumulators
-    max_rows = tl.full([TILE_M], float('-inf'), dtype=tl.float32)
-    sum_rows = tl.zeros([TILE_M], dtype=tl.float32)
-    z_acc = tl.zeros([TILE_M, BLOCK_D], dtype=tl.float32)
-
-    num_tiles = tl.cdiv(M, TILE_M)
-    range_j = tl.arange(0, TILE_M)
-
-    # Software pipelining: prefetch first tiles
-    al_next = al_desc.load([0, 0])
-    y_next = y_desc.load([0, 0])
-    cl_next = tl.load(cl_base + stride_cl_m * range_j, mask=range_j < M, other=0.0)
-
-    # Main loop with pipelining
-    for tile_idx in range(num_tiles):
-        j_start = tile_idx * TILE_M
-        j_range = j_start + range_j
-        j_mask = j_range < M
-
-        # Use prefetched data
-        al_tile = al_next
-        y_tile = y_next
-        cl_tile = cl_next
-
-        # Prefetch next tiles (if not last iteration)
-        next_tile_idx = tile_idx + 1
-        if next_tile_idx < num_tiles:
-            next_j_start = next_tile_idx * TILE_M
-            al_next = al_desc.load([next_j_start, 0])
-            y_next = y_desc.load([next_j_start, 0])
-            next_j_range = next_j_start + range_j
-            cl_next = tl.load(cl_base + stride_cl_m * next_j_range, mask=next_j_range < M, other=0.0)
-
-        # Compute attention scores
-        al_bf16 = al_tile.to(tl.bfloat16)
-        scores = tl.dot(q_bf16, tl.trans(al_bf16), out_dtype=tl.float32)
-        scores = scores - cl_tile[None, :]
-        scores = tl.where(j_mask[None, :], scores, float('-inf'))
-
-        # Online softmax update
-        tile_max = tl.max(scores, axis=1)
-        new_max = tl.maximum(max_rows, tile_max)
-
-        scale = tl.exp(max_rows - new_max)
-        z_acc = z_acc * scale[:, None]
-        sum_rows = sum_rows * scale
-
-        exp_scores = tl.exp(scores - new_max[:, None])
-
-        y_bf16 = y_tile.to(tl.bfloat16)
-        z_acc = z_acc + tl.dot(exp_scores.to(tl.bfloat16), y_bf16, out_dtype=tl.float32)
-        sum_rows = sum_rows + tl.sum(exp_scores, axis=1)
-
-        max_rows = new_max
-
-    # Final normalization
-    z = z_acc / sum_rows[:, None]
-
-    # Store z
-    z_block_ptr = (
-        z_ptr + stride_z_e * idx_e + stride_z_h * idx_h
-        + stride_z_b * (idx_b - pad_offset)
-        + (stride_z_m * i_range[:, None] + stride_z_d * range_d[None, :])
-    )
-    tl.store(z_block_ptr, z.to(q_tile.dtype), mask=q_mask_i[:, None] & mask_d[None, :])
 
 
 def get_optimal_num_warps(block_b: int, block_d: int) -> int:
@@ -1732,7 +958,6 @@ def monarch_attention_triton(
     eps: float = 0.0,
 ) -> Tensor:
     assert T > 1
-    check_inputs(q, k, v)
 
     # Ensure inputs are contiguous for coalesced memory access
     if not q.is_contiguous():
@@ -1768,13 +993,6 @@ def monarch_attention_triton(
     use_tiled_kernels = raw_block_m > MAX_BLOCK_M or (raw_block_m == MAX_BLOCK_M and B >= MAX_BLOCK_B)
     BLOCK_M = min(raw_block_m, MAX_BLOCK_M)
 
-    # TMA with software pipelining benefits from larger tile sizes (128 vs 64)
-    # At TILE_M=128, TMA shows 2.64x speedup for M>=4096
-    # But TILE_M=128 causes register pressure issues in _ar_cr kernels
-    # TMA also requires contiguous [M, D] memory which our [E,H,M,B,D] layout doesn't provide
-    # Future work: transpose to [E,H,B,M,D] layout for TMA benefits
-    use_tma = False
-
     # Warp and stage counts for non-autotuned kernels (small M/B path)
     num_warps_b = get_optimal_num_warps(BLOCK_B, BLOCK_D)
     num_warps_m = get_optimal_num_warps(BLOCK_M, BLOCK_D)
@@ -1786,7 +1004,14 @@ def monarch_attention_triton(
     k_strides = (k.stride(0), k.stride(1), B * k.stride(2), k.stride(2), k.stride(3))
     v_strides = (v.stride(0), v.stride(1), B * v.stride(2), v.stride(2), v.stride(3))
 
-    ar = torch.empty(E, H, M, B, D, device=q.device, dtype=q.dtype)
+    # Pre-copy q into [E,H,M,B,D] layout with zero-padding.
+    # Pre-copy q into ar so kernels always receive [E,H,M,B,D] layout.
+    ar = torch.zeros(E, H, M, B, D, device=q.device, dtype=q.dtype)
+    ar_flat = ar.view(E, H, M * B, D)
+    if pre_pad:
+        ar_flat[:, :, M * B - N:, :] = q
+    else:
+        ar_flat[:, :, :N, :] = q
     al = torch.empty_like(ar)
 
     ar_strides = (ar.stride(0), ar.stride(1), ar.stride(2), ar.stride(3), ar.stride(4))
@@ -1834,24 +1059,29 @@ def monarch_attention_triton(
                 Allocates intermediates internally so torch.ones(cr) is captured
                 in the graph and replayed (resetting cr) on each replay.
                 """
-                _ar = torch.empty(E, H, M, B, D, device=s_q.device, dtype=s_q.dtype)
+                _ar = torch.zeros(E, H, M, B, D, device=s_q.device, dtype=s_q.dtype)
+                _ar_flat = _ar.view(E, H, M * B, D)
+                if pre_pad:
+                    _ar_flat[:, :, M * B - N:, :] = s_q
+                else:
+                    _ar_flat[:, :, :N, :] = s_q
                 _al = torch.empty_like(_ar)
                 _cr = torch.ones(E, H, M, B, device=s_q.device, dtype=torch.float)
                 _cl = torch.empty_like(_cr)
                 _ar_s = (_ar.stride(0), _ar.stride(1), _ar.stride(2), _ar.stride(3), _ar.stride(4))
                 _cr_s = (_cr.stride(0), _cr.stride(1), _cr.stride(2), _cr.stride(3))
 
+                _y = torch.empty_like(_ar)
+
                 for t in range(T - 1):
-                    is_first = t == 0
-                    ar_in = s_q if is_first else _ar
-                    ar_in_s = s_q_strides if is_first else _ar_s
                     _al_cl_kernel[grid_ehm](
-                        ar_in, *ar_in_s, s_k, *s_k_strides,
-                        _cr, *_cr_s, _al, *_ar_s, _cl, *_cr_s,
+                        _ar, *_ar_s, s_k, *s_k_strides, s_v, *s_v_strides,
+                        _cr, *_cr_s, _al, *_ar_s, _y, *_ar_s, _cl, *_cr_s,
                         s_mask, *s_mask_strides, sm_scale,
                         HAS_ATTN_MASK=s_mask is not None,
                         BLOCK_B=BLOCK_B, BLOCK_D=BLOCK_D, PRE_PAD=pre_pad, EPS=eps,
-                        IS_FIRST_CALL=is_first, H=H, M=M, B=B, D=D, N=N,
+                        COMPUTE_Y=False,
+                        H=H, M=M, B=B, D=D, N=N,
                         num_warps=num_warps_b, num_stages=num_stages,
                     )
                     _ar_cr_kernel[grid_ehb](
@@ -1864,13 +1094,13 @@ def monarch_attention_triton(
                         num_warps=num_warps_m, num_stages=num_stages,
                     )
 
-                _y = torch.empty_like(_al)
-                _al_y_cl_kernel[grid_ehm](
+                _al_cl_kernel[grid_ehm](
                     _ar, *_ar_s, s_k, *s_k_strides, s_v, *s_v_strides,
                     _cr, *_cr_s, _al, *_ar_s, _y, *_ar_s, _cl, *_cr_s,
                     s_mask, *s_mask_strides, sm_scale,
                     HAS_ATTN_MASK=s_mask is not None,
                     BLOCK_B=BLOCK_B, BLOCK_D=BLOCK_D, PRE_PAD=pre_pad, EPS=eps,
+                    COMPUTE_Y=True,
                     H=H, M=M, B=B, D=D, N=N,
                     num_warps=num_warps_b, num_stages=num_stages,
                 )
@@ -1909,21 +1139,26 @@ def monarch_attention_triton(
         cached['graph'].replay()
         return cached['z'].clone()
 
+    y = torch.empty_like(al)
+    y_strides = (y.stride(0), y.stride(1), y.stride(2), y.stride(3), y.stride(4))
+
     for t in range(T - 1):
-        is_first_call = t == 0
-        _ar = q if is_first_call else ar
         if use_tiled_b_kernels:
             # Grid uses lambda — TILE_B comes from autotuning
             grid_al_cl_tiled = lambda META: (E * H, M, triton.cdiv(B, META['TILE_B']))
             _al_cl_kernel_tiled[grid_al_cl_tiled](
-                _ar,
+                ar,
                 *ar_strides,
                 k,
                 *k_strides,
+                v,
+                *v_strides,
                 cr,
                 *cr_strides,
                 al,
                 *al_strides,
+                y,
+                *y_strides,
                 cl,
                 *cl_strides,
                 attn_mask,
@@ -1933,7 +1168,7 @@ def monarch_attention_triton(
                 BLOCK_D=BLOCK_D,  # type: ignore
                 PRE_PAD=pre_pad,  # type: ignore
                 EPS=eps,  # type: ignore
-                IS_FIRST_CALL=is_first_call,  # type: ignore
+                COMPUTE_Y=False,  # type: ignore
                 H=H,  # type: ignore
                 M=M,  # type: ignore
                 B=B,  # type: ignore
@@ -1942,14 +1177,18 @@ def monarch_attention_triton(
             )
         else:
             _al_cl_kernel[grid_ehm](
-                _ar,
+                ar,
                 *ar_strides,
                 k,
                 *k_strides,
+                v,
+                *v_strides,
                 cr,
                 *cr_strides,
                 al,
                 *al_strides,
+                y,
+                *y_strides,
                 cl,
                 *cl_strides,
                 attn_mask,
@@ -1960,7 +1199,7 @@ def monarch_attention_triton(
                 BLOCK_D=BLOCK_D,  # type: ignore
                 PRE_PAD=pre_pad,  # type: ignore
                 EPS=eps,  # type: ignore
-                IS_FIRST_CALL=is_first_call,  # type: ignore
+                COMPUTE_Y=False,  # type: ignore
                 H=H,  # type: ignore
                 M=M,  # type: ignore
                 B=B,  # type: ignore
@@ -1982,85 +1221,41 @@ def monarch_attention_triton(
             max_strides = (softmax_max.stride(0), softmax_max.stride(1), softmax_max.stride(2), softmax_max.stride(3))
             sum_strides = (softmax_sum.stride(0), softmax_sum.stride(1), softmax_sum.stride(2), softmax_sum.stride(3))
 
-            if use_tma:
-                num_warps_tiled = get_optimal_num_warps(TILED_BLOCK_M, BLOCK_D)
-                # Use TMA-optimized kernels with software pipelining for M > 4096
-                # Phase 1: Compute softmax stats with TMA
-                _ar_cr_softmax_stats_kernel_tma[grid_tiled](
-                    al, *al_strides,
-                    q, *q_strides,
-                    cl, *cl_strides,
-                    softmax_max, *max_strides,
-                    softmax_sum, *sum_strides,
-                    TILE_M=TILED_BLOCK_M,  # type: ignore
-                    BLOCK_D=BLOCK_D,  # type: ignore
-                    PRE_PAD=pre_pad,  # type: ignore
-                    H=H,  # type: ignore
-                    M=M,  # type: ignore
-                    B=B,  # type: ignore
-                    D=D,  # type: ignore
-                    N=N,  # type: ignore
-                    num_warps=num_warps_tiled,
-                    num_stages=num_stages,
-                )
+            # Phase 1: Compute softmax stats
+            _ar_cr_softmax_stats_kernel[grid_tiled](
+                al, *al_strides,
+                q, *q_strides,
+                cl, *cl_strides,
+                softmax_max, *max_strides,
+                softmax_sum, *sum_strides,
+                TILE_M=TILED_BLOCK_M,  # type: ignore
+                BLOCK_D=BLOCK_D,  # type: ignore
+                PRE_PAD=pre_pad,  # type: ignore
+                H=H,  # type: ignore
+                M=M,  # type: ignore
+                B=B,  # type: ignore
+                D=D,  # type: ignore
+                N=N,  # type: ignore
+            )
 
-                # Phase 2: Accumulate ar and cr with TMA
-                _ar_cr_accumulate_kernel_tma[grid_tiled](
-                    al, *al_strides,
-                    q, *q_strides,
-                    cl, *cl_strides,
-                    softmax_max, *max_strides,
-                    softmax_sum, *sum_strides,
-                    ar, *ar_strides,
-                    cr, *cr_strides,
-                    TILE_M=TILED_BLOCK_M,  # type: ignore
-                    BLOCK_D=BLOCK_D,  # type: ignore
-                    PRE_PAD=pre_pad,  # type: ignore
-                    H=H,  # type: ignore
-                    M=M,  # type: ignore
-                    B=B,  # type: ignore
-                    D=D,  # type: ignore
-                    N=N,  # type: ignore
-                    num_warps=num_warps_tiled,
-                    num_stages=num_stages,
-                )
-            else:
-                # Autotuned tiled kernels (num_warps/num_stages chosen by @triton.autotune)
-                # Phase 1: Compute softmax stats
-                _ar_cr_softmax_stats_kernel[grid_tiled](
-                    al, *al_strides,
-                    q, *q_strides,
-                    cl, *cl_strides,
-                    softmax_max, *max_strides,
-                    softmax_sum, *sum_strides,
-                    TILE_M=TILED_BLOCK_M,  # type: ignore
-                    BLOCK_D=BLOCK_D,  # type: ignore
-                    PRE_PAD=pre_pad,  # type: ignore
-                    H=H,  # type: ignore
-                    M=M,  # type: ignore
-                    B=B,  # type: ignore
-                    D=D,  # type: ignore
-                    N=N,  # type: ignore
-                )
-
-                # Phase 2: Accumulate ar and cr
-                _ar_cr_accumulate_kernel[grid_tiled](
-                    al, *al_strides,
-                    q, *q_strides,
-                    cl, *cl_strides,
-                    softmax_max, *max_strides,
-                    softmax_sum, *sum_strides,
-                    ar, *ar_strides,
-                    cr, *cr_strides,
-                    TILE_M=TILED_BLOCK_M,  # type: ignore
-                    BLOCK_D=BLOCK_D,  # type: ignore
-                    PRE_PAD=pre_pad,  # type: ignore
-                    H=H,  # type: ignore
-                    M=M,  # type: ignore
-                    B=B,  # type: ignore
-                    D=D,  # type: ignore
-                    N=N,  # type: ignore
-                )
+            # Phase 2: Accumulate ar and cr
+            _ar_cr_accumulate_kernel[grid_tiled](
+                al, *al_strides,
+                q, *q_strides,
+                cl, *cl_strides,
+                softmax_max, *max_strides,
+                softmax_sum, *sum_strides,
+                ar, *ar_strides,
+                cr, *cr_strides,
+                TILE_M=TILED_BLOCK_M,  # type: ignore
+                BLOCK_D=BLOCK_D,  # type: ignore
+                PRE_PAD=pre_pad,  # type: ignore
+                H=H,  # type: ignore
+                M=M,  # type: ignore
+                B=B,  # type: ignore
+                D=D,  # type: ignore
+                N=N,  # type: ignore
+            )
         else:
             _ar_cr_kernel[grid_ehb](
                 al,
@@ -2088,13 +1283,10 @@ def monarch_attention_triton(
                 num_stages=num_stages,
             )
 
-    y = torch.empty_like(al)
-    y_strides = (y.stride(0), y.stride(1), y.stride(2), y.stride(3), y.stride(4))
-
     if use_tiled_b_kernels:
         # Grid uses lambda — TILE_B comes from autotuning
         grid_al_y_cl_tiled = lambda META: (E * H, M, triton.cdiv(B, META['TILE_B']))
-        _al_y_cl_kernel_tiled[grid_al_y_cl_tiled](
+        _al_cl_kernel_tiled[grid_al_y_cl_tiled](
             ar,
             *ar_strides,
             k,
@@ -2116,6 +1308,7 @@ def monarch_attention_triton(
             BLOCK_D=BLOCK_D,  # type: ignore
             PRE_PAD=pre_pad,  # type: ignore
             EPS=eps,  # type: ignore
+            COMPUTE_Y=True,  # type: ignore
             H=H,  # type: ignore
             M=M,  # type: ignore
             B=B,  # type: ignore
@@ -2123,7 +1316,7 @@ def monarch_attention_triton(
             N=N,  # type: ignore
         )
     else:
-        _al_y_cl_kernel[grid_ehm](
+        _al_cl_kernel[grid_ehm](
             ar,
             *ar_strides,
             k,
@@ -2146,6 +1339,7 @@ def monarch_attention_triton(
             BLOCK_D=BLOCK_D,  # type: ignore
             PRE_PAD=pre_pad,  # type: ignore
             EPS=eps,  # type: ignore
+            COMPUTE_Y=True,  # type: ignore
             H=H,  # type: ignore
             M=M,  # type: ignore
             B=B,  # type: ignore
@@ -2159,45 +1353,22 @@ def monarch_attention_triton(
     z_strides = (z.stride(0), z.stride(1), B * z.stride(2), z.stride(2), z.stride(3))
 
     if use_tiled_kernels:
-        if use_tma:
-            # Use TMA-optimized kernel with software pipelining for M > 4096
-            num_m_tiles = triton.cdiv(M, TILED_BLOCK_M)
-            grid_tiled_z = (E * H, B, num_m_tiles)
-            num_warps_tiled = get_optimal_num_warps(TILED_BLOCK_M, BLOCK_D)
-            _z_kernel_tiled_tma[grid_tiled_z](
-                al, *al_strides,
-                q, *q_strides,
-                y, *y_strides,
-                cl, *cl_strides,
-                z, *z_strides,
-                TILE_M=TILED_BLOCK_M,  # type: ignore
-                BLOCK_D=BLOCK_D,  # type: ignore
-                PRE_PAD=pre_pad,  # type: ignore
-                H=H,  # type: ignore
-                M=M,  # type: ignore
-                B=B,  # type: ignore
-                D=D,  # type: ignore
-                N=N,  # type: ignore
-                num_warps=num_warps_tiled,
-                num_stages=num_stages,
-            )
-        else:
-            # Autotuned tiled z kernel — TILE_M, num_warps, num_stages from @triton.autotune
-            grid_z_tiled = lambda META: (E * H, B, triton.cdiv(M, META['TILE_M']))
-            _z_kernel_tiled[grid_z_tiled](
-                al, *al_strides,
-                q, *q_strides,
-                y, *y_strides,
-                cl, *cl_strides,
-                z, *z_strides,
-                BLOCK_D=BLOCK_D,  # type: ignore
-                PRE_PAD=pre_pad,  # type: ignore
-                H=H,  # type: ignore
-                M=M,  # type: ignore
-                B=B,  # type: ignore
-                D=D,  # type: ignore
-                N=N,  # type: ignore
-            )
+        # Autotuned tiled z kernel — TILE_M, num_warps, num_stages from @triton.autotune
+        grid_z_tiled = lambda META: (E * H, B, triton.cdiv(M, META['TILE_M']))
+        _z_kernel_tiled[grid_z_tiled](
+            al, *al_strides,
+            q, *q_strides,
+            y, *y_strides,
+            cl, *cl_strides,
+            z, *z_strides,
+            BLOCK_D=BLOCK_D,  # type: ignore
+            PRE_PAD=pre_pad,  # type: ignore
+            H=H,  # type: ignore
+            M=M,  # type: ignore
+            B=B,  # type: ignore
+            D=D,  # type: ignore
+            N=N,  # type: ignore
+        )
     else:
         _z_kernel[grid_ehb](
             al,
