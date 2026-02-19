@@ -65,7 +65,7 @@ def _get_tiled_b_autotune_configs():
 def _get_warp_stage_autotune_configs():
     """Configs for kernels where only num_warps/num_stages are tuned."""
     configs = []
-    for num_warps in [4, 8]:
+    for num_warps in [2, 4, 8]:
         for num_stages in [2, 3, 4]:
             configs.append(triton.Config(
                 {}, num_warps=num_warps, num_stages=num_stages,
