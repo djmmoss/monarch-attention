@@ -1765,7 +1765,7 @@ def monarch_attention_triton(
     # For tiled kernels, TILE_M is autotuned by @triton.autotune for _z_kernel_tiled.
     # For the ar_cr pair, TILE_M must match between stats and accumulate kernels.
     TILED_BLOCK_M = 64
-    use_tiled_kernels = raw_block_m > MAX_BLOCK_M
+    use_tiled_kernels = raw_block_m > MAX_BLOCK_M or (raw_block_m == MAX_BLOCK_M and B >= MAX_BLOCK_B)
     BLOCK_M = min(raw_block_m, MAX_BLOCK_M)
 
     # TMA with software pipelining benefits from larger tile sizes (128 vs 64)
