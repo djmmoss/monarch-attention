@@ -1,0 +1,115 @@
+"""Benchmark Monarch Attention: Torch vs Triton across sequence lengths."""
+
+import torch
+import triton
+import time
+
+def benchmark_monarch_attention():
+    """Compare torch vs triton monarch attention across sequence lengths."""
+    from ma.ma_torch import monarch_attention_torch as ma_torch
+    from ma.ma_triton import monarch_attention_triton as ma_triton
+
+    print("=" * 80)
+    print("Monarch Attention: Torch vs Triton Benchmark")
+    print("=" * 80)
+
+    # Fixed parameters
+    E, H, D, B, T = 2, 8, 64, 32, 2
+
+    # Sequence lengths to test (up to 128k)
+    seq_lengths = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
+
+    print(f"\nConfig: E={E}, H={H}, D={D}, B={B}, T={T}")
+    print(f"{'N':>8} {'M':>6} {'Torch (ms)':>12} {'Triton (ms)':>12} {'Speedup':>10} {'Max Diff':>10}")
+    print("-" * 80)
+
+    for N in seq_lengths:
+        M = triton.cdiv(N, B)
+
+        # Create input tensors
+        Q = torch.randn(E, H, N, D, device='cuda', dtype=torch.bfloat16)
+        K = torch.randn(E, H, N, D, device='cuda', dtype=torch.bfloat16)
+        V = torch.randn(E, H, N, D, device='cuda', dtype=torch.bfloat16)
+
+        # Warmup and correctness check
+        try:
+            out_torch = ma_torch(Q, K, V, None, T, B, pre_pad=True)
+            out_triton = ma_triton(Q, K, V, None, T, B, pre_pad=True)
+            torch.cuda.synchronize()
+
+            max_diff = (out_torch - out_triton).abs().max().item()
+
+            # Benchmark torch
+            def run_torch():
+                return ma_torch(Q, K, V, None, T, B, pre_pad=True)
+
+            # Benchmark triton
+            def run_triton():
+                return ma_triton(Q, K, V, None, T, B, pre_pad=True)
+
+            ms_torch = triton.testing.do_bench(run_torch, warmup=5, rep=20)
+            ms_triton = triton.testing.do_bench(run_triton, warmup=5, rep=20)
+
+            speedup = ms_torch / ms_triton
+            print(f"{N:>8} {M:>6} {ms_torch:>12.3f} {ms_triton:>12.3f} {speedup:>10.2f}x {max_diff:>10.6f}")
+
+        except Exception as e:
+            print(f"{N:>8} {M:>6} ERROR: {str(e)[:40]}")
+
+        # Clear cache
+        torch.cuda.empty_cache()
+
+
+def benchmark_vs_softmax():
+    """Compare monarch attention vs standard softmax attention."""
+    print("\n" + "=" * 80)
+    print("Monarch Attention vs Softmax Attention")
+    print("=" * 80)
+
+    from ma.ma_triton import monarch_attention_triton as ma_triton
+
+    E, H, D, B, T = 2, 8, 64, 32, 2
+    seq_lengths = [512, 1024, 2048, 4096, 8192, 16384, 32768]
+
+    print(f"\nConfig: E={E}, H={H}, D={D}")
+    print(f"{'N':>8} {'Softmax (ms)':>14} {'Monarch (ms)':>14} {'Ratio':>10}")
+    print("-" * 60)
+
+    for N in seq_lengths:
+        Q = torch.randn(E, H, N, D, device='cuda', dtype=torch.bfloat16)
+        K = torch.randn(E, H, N, D, device='cuda', dtype=torch.bfloat16)
+        V = torch.randn(E, H, N, D, device='cuda', dtype=torch.bfloat16)
+
+        try:
+            # Standard softmax attention (scaled dot product)
+            def run_softmax():
+                scale = 1.0 / (D ** 0.5)
+                scores = torch.matmul(Q, K.transpose(-2, -1)) * scale
+                attn = torch.softmax(scores, dim=-1)
+                return torch.matmul(attn, V)
+
+            def run_monarch():
+                return ma_triton(Q, K, V, None, T, B, pre_pad=True)
+
+            # Warmup
+            run_softmax()
+            run_monarch()
+            torch.cuda.synchronize()
+
+            ms_softmax = triton.testing.do_bench(run_softmax, warmup=5, rep=20)
+            ms_monarch = triton.testing.do_bench(run_monarch, warmup=5, rep=20)
+
+            ratio = ms_monarch / ms_softmax
+            print(f"{N:>8} {ms_softmax:>14.3f} {ms_monarch:>14.3f} {ratio:>10.2f}x")
+
+        except torch.cuda.OutOfMemoryError:
+            print(f"{N:>8} OOM for softmax")
+        except Exception as e:
+            print(f"{N:>8} ERROR: {str(e)[:40]}")
+
+        torch.cuda.empty_cache()
+
+
+if __name__ == "__main__":
+    benchmark_monarch_attention()
+    benchmark_vs_softmax()
