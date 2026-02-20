@@ -310,16 +310,22 @@ def _al_cl_kernel_tiled(
     mask_q = range_q < B
     mask_d = range_d < D
 
-    # Load ar (always from [E,H,M,B,D] tensor - q is pre-copied into ar)
-    ar_base = ar_ptr + stride_ar_e * idx_e + stride_ar_h * idx_h + stride_ar_m * idx_m
-    ar_offset = stride_ar_b * range_q[:, None] + range_d[None, :]
-    ar = tl.load(ar_base + ar_offset, mask=mask_q[:, None] & mask_d[None, :], other=0.0)
+    # Load ar using block pointer [TILE_B, D]
+    ar_block_ptr = tl.make_block_ptr(
+        base=ar_ptr + stride_ar_e * idx_e + stride_ar_h * idx_h + stride_ar_m * idx_m,
+        shape=(B, D),
+        strides=(stride_ar_b, stride_ar_d),
+        offsets=(q_start, 0),
+        block_shape=(TILE_B, BLOCK_D),
+        order=(1, 0),
+    )
+    ar = tl.load(ar_block_ptr, boundary_check=(0, 1), padding_option="zero")
     if USE_FP8:
         ar_tc = ar.to(tl.float8e4nv)
     else:
         ar_tc = ar.to(tl.bfloat16)
 
-    # Load cr for query tile
+    # Load cr for query tile - 1D, keep manual
     cr_base = cr_ptr + stride_cr_e * idx_e + stride_cr_h * idx_h + stride_cr_m * idx_m
     cr = tl.load(cr_base + stride_cr_b * range_q, mask=mask_q, other=1.0)
 
@@ -331,13 +337,28 @@ def _al_cl_kernel_tiled(
         y_acc = tl.zeros([TILE_B, BLOCK_D], dtype=tl.float32)
     score_acc = tl.zeros([TILE_B], dtype=tl.float32)
 
-    # Loop over key tiles
-    k_base = k_ptr + stride_k_e * idx_e + stride_k_h * idx_h + stride_k_m * idx_m
+    # Block pointers for k and v tiles (advanced in loop)
+    k_block_ptr = tl.make_block_ptr(
+        base=k_ptr + stride_k_e * idx_e + stride_k_h * idx_h + stride_k_m * idx_m,
+        shape=(B, D),
+        strides=(stride_k_b, stride_k_d),
+        offsets=(0 - pad_offset, 0),
+        block_shape=(TILE_B, BLOCK_D),
+        order=(1, 0),
+    )
     if COMPUTE_Y:
-        v_base = v_ptr + stride_v_e * idx_e + stride_v_h * idx_h + stride_v_m * idx_m
+        v_block_ptr = tl.make_block_ptr(
+            base=v_ptr + stride_v_e * idx_e + stride_v_h * idx_h + stride_v_m * idx_m,
+            shape=(B, D),
+            strides=(stride_v_b, stride_v_d),
+            offsets=(0 - pad_offset, 0),
+            block_shape=(TILE_B, BLOCK_D),
+            order=(1, 0),
+        )
     range_k = tl.arange(0, TILE_B)
 
     for k_start in tl.range(0, B, TILE_B, num_stages=3):
+        # Compute validity mask for -inf masking (block ptr handles boundary zeros)
         k_range = k_start + range_k
         k_mask = k_range < B
         if PRE_PAD:
@@ -346,25 +367,23 @@ def _al_cl_kernel_tiled(
             k_valid = k_mask & ((block_start_n + k_range) < N)
 
         if HAS_ATTN_MASK:
-            mask_block_ptr = (
+            mask_block_offset = (
                 mask_ptr + stride_mask_e * idx_e + stride_mask_m * idx_m
                 + stride_mask_b * (k_range - pad_offset)
             )
-            valid_token_mask = tl.load(mask_block_ptr, mask=k_valid, other=0)
+            valid_token_mask = tl.load(mask_block_offset, mask=k_valid, other=0)
             k_valid = k_valid & valid_token_mask
 
-        # Load key tile [TILE_B, D]
-        k_offset = stride_k_b * (k_range - pad_offset)[:, None] + range_d[None, :]
-        k_tile = tl.load(k_base + k_offset, mask=k_valid[:, None] & mask_d[None, :], other=0.0)
+        # Load key tile [TILE_B, D] using block pointer
+        k_tile = tl.load(k_block_ptr, boundary_check=(0, 1), padding_option="zero")
         if USE_FP8:
             k_tc = k_tile.to(tl.float8e4nv)
         else:
             k_tc = k_tile.to(tl.bfloat16)
 
         if COMPUTE_Y:
-            # Load value tile [TILE_B, D]
-            v_offset = stride_v_b * (k_range - pad_offset)[:, None] + range_d[None, :]
-            v_tile = tl.load(v_base + v_offset, mask=k_valid[:, None] & mask_d[None, :], other=0.0)
+            # Load value tile [TILE_B, D] using block pointer
+            v_tile = tl.load(v_block_ptr, boundary_check=(0, 1), padding_option="zero")
             if USE_FP8:
                 v_tc = v_tile.to(tl.float8e4nv)
             else:
@@ -400,24 +419,41 @@ def _al_cl_kernel_tiled(
         sum_rows = sum_rows + tl.sum(exp_scores, axis=1)
         max_rows = new_max
 
+        # Advance block pointers to next tile
+        k_block_ptr = tl.advance(k_block_ptr, (TILE_B, 0))
+        if COMPUTE_Y:
+            v_block_ptr = tl.advance(v_block_ptr, (TILE_B, 0))
+
     # Finalize outputs
     safe_sum = tl.where(sum_rows > 0, sum_rows, 1.0)
     al = (sm_scale * al_acc / safe_sum[:, None]).to(ar.dtype)
     cl = tl.where(sum_rows > 0, score_acc / safe_sum - max_rows - tl.log(safe_sum), 0.0)
 
-    # Store al
-    al_base = al_ptr + stride_al_e * idx_e + stride_al_h * idx_h + stride_al_m * idx_m
-    al_offset = stride_al_b * range_q[:, None] + range_d[None, :]
-    tl.store(al_base + al_offset, al, mask=mask_q[:, None] & mask_d[None, :])
+    # Store al using block pointer
+    al_block_ptr = tl.make_block_ptr(
+        base=al_ptr + stride_al_e * idx_e + stride_al_h * idx_h + stride_al_m * idx_m,
+        shape=(B, D),
+        strides=(stride_al_b, stride_al_d),
+        offsets=(q_start, 0),
+        block_shape=(TILE_B, BLOCK_D),
+        order=(1, 0),
+    )
+    tl.store(al_block_ptr, al, boundary_check=(0, 1))
 
     if COMPUTE_Y:
-        # Store y
+        # Store y using block pointer
         y = (y_acc / safe_sum[:, None]).to(ar.dtype)
-        y_base = y_ptr + stride_y_e * idx_e + stride_y_h * idx_h + stride_y_m * idx_m
-        y_offset = stride_y_b * range_q[:, None] + range_d[None, :]
-        tl.store(y_base + y_offset, y, mask=mask_q[:, None] & mask_d[None, :])
+        y_block_ptr = tl.make_block_ptr(
+            base=y_ptr + stride_y_e * idx_e + stride_y_h * idx_h + stride_y_m * idx_m,
+            shape=(B, D),
+            strides=(stride_y_b, stride_y_d),
+            offsets=(q_start, 0),
+            block_shape=(TILE_B, BLOCK_D),
+            order=(1, 0),
+        )
+        tl.store(y_block_ptr, y, boundary_check=(0, 1))
 
-    # Store cl
+    # Store cl - 1D, keep manual
     cl_base = cl_ptr + stride_cl_e * idx_e + stride_cl_h * idx_h + stride_cl_m * idx_m
     tl.store(cl_base + stride_cl_b * range_q, cl, mask=mask_q)
 
@@ -714,13 +750,18 @@ def _ar_cr_softmax_stats_kernel(
         q_mask_j = j_mask & ((idx_b + B * j_range) < N)
 
     # Pre-compute base pointers
-    q_base = q_ptr + stride_q_e * idx_e + stride_q_h * idx_h + stride_q_b * (idx_b - pad_offset)
-    al_base = al_ptr + stride_al_e * idx_e + stride_al_h * idx_h + stride_al_b * idx_b
     cl_base = cl_ptr + stride_cl_e * idx_e + stride_cl_h * idx_h + stride_cl_b * idx_b
 
-    # Load q_tile [TILE_M, D] - the "key" positions for this column tile
-    q_offset = stride_q_m * j_range[:, None] + stride_q_d * range_d[None, :]
-    q_tile = tl.load(q_base + q_offset, mask=q_mask_j[:, None] & mask_d[None, :], other=0.0)
+    # Load q_tile [TILE_M, D] using block pointer
+    q_block_ptr = tl.make_block_ptr(
+        base=q_ptr + stride_q_e * idx_e + stride_q_h * idx_h + stride_q_b * (idx_b - pad_offset),
+        shape=(M, D),
+        strides=(stride_q_m, stride_q_d),
+        offsets=(j_start, 0),
+        block_shape=(TILE_M, BLOCK_D),
+        order=(1, 0),
+    )
+    q_tile = tl.load(q_block_ptr, boundary_check=(0, 1), padding_option="zero")
     if USE_FP8:
         q_tc = q_tile.to(tl.float8e4nv)
     else:
@@ -730,17 +771,26 @@ def _ar_cr_softmax_stats_kernel(
     max_cols = tl.full([TILE_M], float('-inf'), dtype=tl.float32)
     sum_cols = tl.zeros([TILE_M], dtype=tl.float32)
 
+    # Block pointer for al tiles (advanced in loop)
+    al_block_ptr = tl.make_block_ptr(
+        base=al_ptr + stride_al_e * idx_e + stride_al_h * idx_h + stride_al_b * idx_b,
+        shape=(M, D),
+        strides=(stride_al_m, stride_al_d),
+        offsets=(0, 0),
+        block_shape=(TILE_M, BLOCK_D),
+        order=(1, 0),
+    )
+
     # Iterate over row tiles (i dimension of al)
     range_i = tl.arange(0, TILE_M)
     for i_start in tl.range(0, M, TILE_M, num_stages=3):
         i_range = i_start + range_i
         i_mask = i_range < M
 
-        # Load al_tile [TILE_M, D]
-        al_offset = stride_al_m * i_range[:, None] + stride_al_d * range_d[None, :]
-        al_tile = tl.load(al_base + al_offset, mask=i_mask[:, None] & mask_d[None, :], other=0.0)
+        # Load al_tile [TILE_M, D] using block pointer
+        al_tile = tl.load(al_block_ptr, boundary_check=(0, 1), padding_option="zero")
 
-        # Load cl_tile [TILE_M]
+        # Load cl_tile [TILE_M] - 1D, keep manual
         cl_tile = tl.load(cl_base + stride_cl_m * i_range, mask=i_mask, other=0.0)
 
         # Compute attention scores [TILE_M_i, TILE_M_j]
@@ -765,6 +815,9 @@ def _ar_cr_softmax_stats_kernel(
         sum_cols = sum_cols + tl.sum(exp_scores, axis=0)
 
         max_cols = new_max
+
+        # Advance block pointer to next row tile
+        al_block_ptr = tl.advance(al_block_ptr, (TILE_M, 0))
 
     # Store max and sum for this column tile
     out_range = j_start + tl.arange(0, TILE_M)
@@ -812,26 +865,41 @@ def _ar_cr_accumulate_kernel(
     mask_d = range_d < D
 
     # Pre-compute base pointers
-    al_base = al_ptr + stride_al_e * idx_e + stride_al_h * idx_h + stride_al_b * idx_b
     cl_base = cl_ptr + stride_cl_e * idx_e + stride_cl_h * idx_h + stride_cl_b * idx_b
-    q_base = q_ptr + stride_q_e * idx_e + stride_q_h * idx_h + stride_q_b * (idx_b - pad_offset)
     max_base = max_ptr + stride_max_e * idx_e + stride_max_h * idx_h + stride_max_b * idx_b
     sum_base = sum_ptr + stride_sum_e * idx_e + stride_sum_h * idx_h + stride_sum_b * idx_b
 
-    # Load al_tile [TILE_M, D] - this tile's rows
-    al_offset = stride_al_m * i_range[:, None] + stride_al_d * range_d[None, :]
-    al_tile = tl.load(al_base + al_offset, mask=i_mask[:, None] & mask_d[None, :], other=0.0)
+    # Load al_tile [TILE_M, D] using block pointer
+    al_block_ptr = tl.make_block_ptr(
+        base=al_ptr + stride_al_e * idx_e + stride_al_h * idx_h + stride_al_b * idx_b,
+        shape=(M, D),
+        strides=(stride_al_m, stride_al_d),
+        offsets=(i_start, 0),
+        block_shape=(TILE_M, BLOCK_D),
+        order=(1, 0),
+    )
+    al_tile = tl.load(al_block_ptr, boundary_check=(0, 1), padding_option="zero")
     if USE_FP8:
         al_tc = al_tile.to(tl.float8e4nv)
     else:
         al_tc = al_tile.to(tl.bfloat16)
 
-    # Load cl_tile [TILE_M]
+    # Load cl_tile [TILE_M] - 1D, keep manual
     cl_tile = tl.load(cl_base + stride_cl_m * i_range, mask=i_mask, other=0.0)
 
     # Initialize accumulators
     ar_acc = tl.zeros([TILE_M, BLOCK_D], dtype=tl.float32)
     cr_acc = tl.zeros([TILE_M], dtype=tl.float32)
+
+    # Block pointer for q tiles (advanced in loop)
+    q_block_ptr = tl.make_block_ptr(
+        base=q_ptr + stride_q_e * idx_e + stride_q_h * idx_h + stride_q_b * (idx_b - pad_offset),
+        shape=(M, D),
+        strides=(stride_q_m, stride_q_d),
+        offsets=(0, 0),
+        block_shape=(TILE_M, BLOCK_D),
+        order=(1, 0),
+    )
 
     # Iterate over column tiles (j dimension)
     range_j = tl.arange(0, TILE_M)
@@ -844,15 +912,14 @@ def _ar_cr_accumulate_kernel(
         else:
             q_mask_j = j_mask & ((idx_b + B * j_range) < N)
 
-        # Load q_tile [TILE_M, D]
-        q_offset = stride_q_m * j_range[:, None] + stride_q_d * range_d[None, :]
-        q_tile = tl.load(q_base + q_offset, mask=q_mask_j[:, None] & mask_d[None, :], other=0.0)
+        # Load q_tile [TILE_M, D] using block pointer
+        q_tile = tl.load(q_block_ptr, boundary_check=(0, 1), padding_option="zero")
         if USE_FP8:
             q_tc = q_tile.to(tl.float8e4nv)
         else:
             q_tc = q_tile.to(tl.bfloat16)
 
-        # Load precomputed max and sum for these columns
+        # Load precomputed max and sum for these columns - 1D, keep manual
         max_cols = tl.load(max_base + stride_max_m * j_range, mask=j_mask, other=0.0)
         sum_cols = tl.load(sum_base + stride_sum_m * j_range, mask=j_mask, other=1.0)  # Avoid div by zero
 
@@ -874,10 +941,19 @@ def _ar_cr_accumulate_kernel(
             ar_acc = ar_acc + tl.dot(l_tile.to(tl.bfloat16), q_tc, out_dtype=tl.float32)
         cr_acc = cr_acc + tl.sum(l_tile, axis=1)
 
-    # Store results
-    ar_base = ar_ptr + stride_ar_e * idx_e + stride_ar_h * idx_h + stride_ar_b * idx_b
-    ar_offset = stride_ar_m * i_range[:, None] + stride_ar_d * range_d[None, :]
-    tl.store(ar_base + ar_offset, ar_acc.to(al_tile.dtype), mask=i_mask[:, None] & mask_d[None, :])
+        # Advance block pointer to next column tile
+        q_block_ptr = tl.advance(q_block_ptr, (TILE_M, 0))
+
+    # Store ar using block pointer
+    ar_store_block_ptr = tl.make_block_ptr(
+        base=ar_ptr + stride_ar_e * idx_e + stride_ar_h * idx_h + stride_ar_b * idx_b,
+        shape=(M, D),
+        strides=(stride_ar_m, stride_ar_d),
+        offsets=(i_start, 0),
+        block_shape=(TILE_M, BLOCK_D),
+        order=(1, 0),
+    )
+    tl.store(ar_store_block_ptr, ar_acc.to(al_tile.dtype), boundary_check=(0, 1))
 
     cr_base = cr_ptr + stride_cr_e * idx_e + stride_cr_h * idx_h + stride_cr_b * idx_b
     tl.store(cr_base + stride_cr_m * i_range, cr_acc, mask=i_mask)
@@ -926,19 +1002,41 @@ def _z_kernel_tiled(
         q_mask_i = i_mask & ((idx_b + B * i_range) < N)
 
     # Pre-compute base pointers
-    q_base = q_ptr + stride_q_e * idx_e + stride_q_h * idx_h + stride_q_b * (idx_b - pad_offset)
-    al_base = al_ptr + stride_al_e * idx_e + stride_al_h * idx_h + stride_al_b * idx_b
     cl_base = cl_ptr + stride_cl_e * idx_e + stride_cl_h * idx_h + stride_cl_b * idx_b
-    y_base = y_ptr + stride_y_e * idx_e + stride_y_h * idx_h + stride_y_b * idx_b
 
-    # Load q_tile [TILE_M, D] - query positions for this output tile
-    q_offset = stride_q_m * i_range[:, None] + stride_q_d * range_d[None, :]
-    q_tile = tl.load(q_base + q_offset, mask=q_mask_i[:, None] & mask_d[None, :], other=0.0)
+    # Load q_tile [TILE_M, D] using block pointer
+    q_block_ptr = tl.make_block_ptr(
+        base=q_ptr + stride_q_e * idx_e + stride_q_h * idx_h + stride_q_b * (idx_b - pad_offset),
+        shape=(M, D),
+        strides=(stride_q_m, stride_q_d),
+        offsets=(i_start, 0),
+        block_shape=(TILE_M, BLOCK_D),
+        order=(1, 0),
+    )
+    q_tile = tl.load(q_block_ptr, boundary_check=(0, 1), padding_option="zero")
 
     # Initialize online softmax accumulators (per row)
     max_rows = tl.full([TILE_M], float('-inf'), dtype=tl.float32)
     sum_rows = tl.zeros([TILE_M], dtype=tl.float32)
     z_acc = tl.zeros([TILE_M, BLOCK_D], dtype=tl.float32)
+
+    # Block pointers for al and y tiles (advanced in loop)
+    al_loop_block_ptr = tl.make_block_ptr(
+        base=al_ptr + stride_al_e * idx_e + stride_al_h * idx_h + stride_al_b * idx_b,
+        shape=(M, D),
+        strides=(stride_al_m, stride_al_d),
+        offsets=(0, 0),
+        block_shape=(TILE_M, BLOCK_D),
+        order=(1, 0),
+    )
+    y_loop_block_ptr = tl.make_block_ptr(
+        base=y_ptr + stride_y_e * idx_e + stride_y_h * idx_h + stride_y_b * idx_b,
+        shape=(M, D),
+        strides=(stride_y_m, stride_y_d),
+        offsets=(0, 0),
+        block_shape=(TILE_M, BLOCK_D),
+        order=(1, 0),
+    )
 
     # Iterate over column tiles (j dimension - al/y positions)
     range_j = tl.arange(0, TILE_M)
@@ -946,16 +1044,14 @@ def _z_kernel_tiled(
         j_range = j_start + range_j
         j_mask = j_range < M
 
-        # Load al_tile [TILE_M, D]
-        al_offset = stride_al_m * j_range[:, None] + stride_al_d * range_d[None, :]
-        al_tile = tl.load(al_base + al_offset, mask=j_mask[:, None] & mask_d[None, :], other=0.0)
+        # Load al_tile [TILE_M, D] using block pointer
+        al_tile = tl.load(al_loop_block_ptr, boundary_check=(0, 1), padding_option="zero")
 
-        # Load cl_tile [TILE_M]
+        # Load cl_tile [TILE_M] - 1D, keep manual
         cl_tile = tl.load(cl_base + stride_cl_m * j_range, mask=j_mask, other=0.0)
 
-        # Load y_tile [TILE_M, D]
-        y_offset = stride_y_m * j_range[:, None] + stride_y_d * range_d[None, :]
-        y_tile = tl.load(y_base + y_offset, mask=j_mask[:, None] & mask_d[None, :], other=0.0)
+        # Load y_tile [TILE_M, D] using block pointer
+        y_tile = tl.load(y_loop_block_ptr, boundary_check=(0, 1), padding_option="zero")
 
         # Compute attention scores [TILE_M_i, TILE_M_j]
         if USE_FP8:
@@ -991,10 +1087,14 @@ def _z_kernel_tiled(
 
         max_rows = new_max
 
+        # Advance block pointers to next column tile
+        al_loop_block_ptr = tl.advance(al_loop_block_ptr, (TILE_M, 0))
+        y_loop_block_ptr = tl.advance(y_loop_block_ptr, (TILE_M, 0))
+
     # Final normalization
     z = z_acc / sum_rows[:, None]
 
-    # Store z
+    # Store z - uses q_mask_i which is pad-aware, so keep manual store
     z_base = z_ptr + stride_z_e * idx_e + stride_z_h * idx_h + stride_z_b * (idx_b - pad_offset)
     z_offset = stride_z_m * i_range[:, None] + stride_z_d * range_d[None, :]
     z_out = z.to(tl.bfloat16) if USE_FP8 else z.to(q_tile.dtype)
