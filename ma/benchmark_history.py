@@ -19,6 +19,7 @@ COMMITS = [
     ("6: CUDA graph", "7b63aa4", "CUDA graph capture + refactor (includes 9487175, 5ab250a)", False, None),
     ("7: fp8", "9738489", "FP8 tensor cores + CUDA graph for fp8 + expanded autotune configs", True, None),
     ("8: block ptrs", "a727008", "Block pointer loads (tl.make_block_ptr) for TMA on Blackwell", True, None),
+    ("9: split+uncap", "56aaf01", "Split tiled kernels, remove block ptrs, uncap block size, IS_FIRST_CALL", True, None),
 ]
 
 SEQ_LENGTHS = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576]
