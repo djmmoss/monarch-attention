@@ -24,9 +24,9 @@ Tensor = torch.Tensor
 def _get_tiled_m_autotune_configs():
     """Configs for kernels with autotuned TILE_M (e.g., _z_kernel_tiled)."""
     configs = []
-    for tile_m in [32, 64, 128]:
-        for num_warps in [4, 8]:
-            for num_stages in [2, 3, 4]:
+    for tile_m in [32, 64, 128, 256]:
+        for num_warps in [4, 8, 16]:
+            for num_stages in [2, 3, 4, 5]:
                 configs.append(triton.Config(
                     {'TILE_M': tile_m}, num_warps=num_warps, num_stages=num_stages,
                 ))
@@ -36,9 +36,9 @@ def _get_tiled_m_autotune_configs():
 def _get_tiled_b_autotune_configs():
     """Configs for kernels with autotuned TILE_B (e.g., _al_cl_kernel_tiled)."""
     configs = []
-    for tile_b in [32, 64, 128]:
-        for num_warps in [4, 8]:
-            for num_stages in [2, 3, 4]:
+    for tile_b in [32, 64, 128, 256]:
+        for num_warps in [4, 8, 16]:
+            for num_stages in [2, 3, 4, 5]:
                 configs.append(triton.Config(
                     {'TILE_B': tile_b}, num_warps=num_warps, num_stages=num_stages,
                 ))
@@ -48,8 +48,8 @@ def _get_tiled_b_autotune_configs():
 def _get_warp_stage_autotune_configs():
     """Configs for kernels where only num_warps/num_stages are tuned."""
     configs = []
-    for num_warps in [2, 4, 8]:
-        for num_stages in [2, 3, 4]:
+    for num_warps in [2, 4, 8, 16]:
+        for num_stages in [2, 3, 4, 5]:
             configs.append(triton.Config(
                 {}, num_warps=num_warps, num_stages=num_stages,
             ))
@@ -1131,18 +1131,24 @@ def monarch_attention_triton(
     # For N <= 4096: tensor copies ~2-8μs, graph saves ~15-35μs = net win (up to 2.4x)
     # For N > 4096: tensor copy cost grows linearly and outweighs launch overhead savings
     MAX_CUDA_GRAPH_N = 4096
-    use_cuda_graph = not use_tiled_kernels and not use_tiled_b_kernels and N <= MAX_CUDA_GRAPH_N and not use_fp8
+    use_cuda_graph = not use_tiled_kernels and not use_tiled_b_kernels and N <= MAX_CUDA_GRAPH_N
     if use_cuda_graph:
-        cache_key = (E, H, N, D, B, T, pre_pad, attn_mask is not None, q.dtype, eps)
+        cache_key = (E, H, N, D, B, T, pre_pad, attn_mask is not None, q.dtype, k.dtype, eps)
         if cache_key not in _cuda_graph_cache:
             # Allocate static input buffers (persist across replays)
             s_q = torch.empty_like(q)
             s_k = torch.empty_like(k)
             s_v = torch.empty_like(v)
             s_mask = torch.empty_like(attn_mask) if attn_mask is not None else None
+            # For fp8, also need static q_for_kernels buffer
+            if use_fp8 and q.dtype != torch.float8_e4m3fn:
+                s_q_fk = torch.empty(E, H, N, D, device=q.device, dtype=torch.float8_e4m3fn)
+            else:
+                s_q_fk = s_q
             s_q_strides = (s_q.stride(0), s_q.stride(1), B * s_q.stride(2), s_q.stride(2), s_q.stride(3))
             s_k_strides = (s_k.stride(0), s_k.stride(1), B * s_k.stride(2), s_k.stride(2), s_k.stride(3))
             s_v_strides = (s_v.stride(0), s_v.stride(1), B * s_v.stride(2), s_v.stride(2), s_v.stride(3))
+            s_qfk_strides = (s_q_fk.stride(0), s_q_fk.stride(1), B * s_q_fk.stride(2), s_q_fk.stride(2), s_q_fk.stride(3))
             s_mask_strides = (
                 (s_mask.stride(0), B * s_mask.stride(1), s_mask.stride(1))
                 if s_mask is not None else (0, 0, 0)
@@ -1154,12 +1160,18 @@ def monarch_attention_triton(
                 Allocates intermediates internally so torch.ones(cr) is captured
                 in the graph and replayed (resetting cr) on each replay.
                 """
-                _ar = torch.zeros(E, H, M, B, D, device=s_q.device, dtype=s_q.dtype)
+                _ar = torch.zeros(E, H, M, B, D, device=s_q.device, dtype=intermediate_dtype)
                 _ar_flat = _ar.view(E, H, M * B, D)
                 if pre_pad:
-                    _ar_flat[:, :, M * B - N:, :] = s_q
+                    if use_fp8 and s_q.dtype != torch.float8_e4m3fn:
+                        _ar_flat[:, :, M * B - N:, :] = s_q.to(intermediate_dtype)
+                    else:
+                        _ar_flat[:, :, M * B - N:, :] = s_q
                 else:
-                    _ar_flat[:, :, :N, :] = s_q
+                    if use_fp8 and s_q.dtype != torch.float8_e4m3fn:
+                        _ar_flat[:, :, :N, :] = s_q.to(intermediate_dtype)
+                    else:
+                        _ar_flat[:, :, :N, :] = s_q
                 _al = torch.empty_like(_ar)
                 _cr = torch.ones(E, H, M, B, device=s_q.device, dtype=torch.float)
                 _cl = torch.empty_like(_cr)
@@ -1168,6 +1180,10 @@ def monarch_attention_triton(
 
                 _y = torch.empty_like(_ar)
 
+                # Convert q for kernels if needed
+                if use_fp8 and s_q.dtype != torch.float8_e4m3fn:
+                    s_q_fk.copy_(s_q.to(torch.float8_e4m3fn))
+
                 for t in range(T - 1):
                     _al_cl_kernel[grid_ehm](
                         _ar, *_ar_s, s_k, *s_k_strides, s_v, *s_v_strides,
@@ -1175,16 +1191,16 @@ def monarch_attention_triton(
                         s_mask, *s_mask_strides, sm_scale,
                         HAS_ATTN_MASK=s_mask is not None,
                         BLOCK_B=BLOCK_B, BLOCK_D=BLOCK_D, PRE_PAD=pre_pad, EPS=eps,
-                        COMPUTE_Y=False,
+                        COMPUTE_Y=False, USE_FP8=use_fp8,
                         H=H, M=M, B=B, D=D, N=N,
                         num_warps=num_warps_b, num_stages=num_stages,
                     )
                     _ar_cr_kernel[grid_ehb](
-                        _al, *_ar_s, s_q, *s_q_strides, _cl, *_cr_s,
+                        _al, *_ar_s, s_q_fk, *s_qfk_strides, _cl, *_cr_s,
                         _ar, *_ar_s, _cr, *_cr_s,
                         s_mask, *s_mask_strides,
                         HAS_ATTN_MASK=s_mask is not None,
-                        BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D, PRE_PAD=pre_pad,
+                        BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D, PRE_PAD=pre_pad, USE_FP8=use_fp8,
                         H=H, M=M, B=B, D=D, N=N,
                         num_warps=num_warps_m, num_stages=num_stages,
                     )
@@ -1195,17 +1211,17 @@ def monarch_attention_triton(
                     s_mask, *s_mask_strides, sm_scale,
                     HAS_ATTN_MASK=s_mask is not None,
                     BLOCK_B=BLOCK_B, BLOCK_D=BLOCK_D, PRE_PAD=pre_pad, EPS=eps,
-                    COMPUTE_Y=True,
+                    COMPUTE_Y=True, USE_FP8=use_fp8,
                     H=H, M=M, B=B, D=D, N=N,
                     num_warps=num_warps_b, num_stages=num_stages,
                 )
 
-                _z = torch.empty(E, H, N, D, device=s_q.device, dtype=s_q.dtype)
+                _z = torch.empty(E, H, N, D, device=s_q.device, dtype=torch.bfloat16 if use_fp8 else s_q.dtype)
                 _z_s = (_z.stride(0), _z.stride(1), B * _z.stride(2), _z.stride(2), _z.stride(3))
                 _z_kernel[grid_ehb](
-                    _al, *_ar_s, s_q, *s_q_strides, _y, *_ar_s, _cl, *_cr_s,
+                    _al, *_ar_s, s_q_fk, *s_qfk_strides, _y, *_ar_s, _cl, *_cr_s,
                     _z, *_z_s,
-                    BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D, PRE_PAD=pre_pad,
+                    BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D, PRE_PAD=pre_pad, USE_FP8=use_fp8,
                     H=H, M=M, B=B, D=D, N=N,
                     num_warps=num_warps_m, num_stages=num_stages,
                 )
