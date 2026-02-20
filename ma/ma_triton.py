@@ -114,6 +114,7 @@ def _al_cl_kernel(
     PRE_PAD: tl.constexpr,
     EPS: tl.constexpr,
     COMPUTE_Y: tl.constexpr,
+    IS_FIRST_CALL: tl.constexpr,
     H: tl.constexpr,
     M: tl.constexpr,
     B: tl.constexpr,
@@ -153,14 +154,23 @@ def _al_cl_kernel(
         valid_token_mask = tl.load(mask_block_ptr, mask=k_mask_b, other=0)
         k_mask_b = k_mask_b & valid_token_mask
 
-    # Load ar (always from [E,H,M,B,D] tensor - q is pre-copied into ar)
+    # Load ar: on first call, ar_ptr points to q (raw [E,H,N,D] with padding offset)
+    # On subsequent calls, ar_ptr points to ar ([E,H,M,B,D], no padding needed)
     ar_base = ar_ptr + base_ehm
-    ar_offset = stride_ar_b * range_b[:, None] + range_d[None, :]
-    ar = tl.load(
-        ar_base + ar_offset,
-        mask=mask_b[:, None] & mask_d[None, :],
-        other=0.0,
-    )
+    if IS_FIRST_CALL:
+        ar_offset = stride_ar_b * (range_b - pad_offset)[:, None] + range_d[None, :]
+        ar = tl.load(
+            ar_base + ar_offset,
+            mask=k_mask_b[:, None] & mask_d[None, :],
+            other=0.0,
+        )
+    else:
+        ar_offset = stride_ar_b * range_b[:, None] + range_d[None, :]
+        ar = tl.load(
+            ar_base + ar_offset,
+            mask=mask_b[:, None] & mask_d[None, :],
+            other=0.0,
+        )
 
     # Load k
     k_base = k_ptr + stride_k_e * idx_e + stride_k_h * idx_h + stride_k_m * idx_m
@@ -242,6 +252,160 @@ def _al_cl_kernel_tiled(
     stride_k_m,
     stride_k_b,
     stride_k_d,
+    cr_ptr,
+    stride_cr_e,
+    stride_cr_h,
+    stride_cr_m,
+    stride_cr_b,
+    al_ptr,
+    stride_al_e,
+    stride_al_h,
+    stride_al_m,
+    stride_al_b,
+    stride_al_d,
+    cl_ptr,
+    stride_cl_e,
+    stride_cl_h,
+    stride_cl_m,
+    stride_cl_b,
+    mask_ptr,
+    stride_mask_e,
+    stride_mask_m,
+    stride_mask_b,
+    sm_scale: float,
+    HAS_ATTN_MASK: tl.constexpr,
+    TILE_B: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    PRE_PAD: tl.constexpr,
+    EPS: tl.constexpr,
+    H: tl.constexpr,
+    M: tl.constexpr,
+    B: tl.constexpr,
+    D: tl.constexpr,
+    N: tl.constexpr,
+    USE_FP8: tl.constexpr = False,
+):
+    """Tiled within-block attention kernel for large B (>128).
+
+    Computes al (attention-weighted keys) and cl (log-sum-exp) only.
+    Uses online softmax to tile over key positions, avoiding B×B matrices.
+    Grid: (E*H, M, cdiv(B, TILE_B))
+    """
+    idx_eh = tl.program_id(0)
+    idx_m = tl.program_id(1)
+    idx_q_tile = tl.program_id(2)
+    idx_e = idx_eh // H
+    idx_h = idx_eh % H
+
+    pad_offset = M * B - N if PRE_PAD else 0
+    block_start_n = B * idx_m
+
+    # Query tile range
+    q_start = idx_q_tile * TILE_B
+    range_q = q_start + tl.arange(0, TILE_B)
+    range_d = tl.arange(0, BLOCK_D)
+    mask_q = range_q < B
+    mask_d = range_d < D
+
+    # Load ar [TILE_B, D]
+    ar_base = ar_ptr + stride_ar_e * idx_e + stride_ar_h * idx_h + stride_ar_m * idx_m
+    ar_offset = stride_ar_b * range_q[:, None] + range_d[None, :]
+    ar = tl.load(ar_base + ar_offset, mask=mask_q[:, None] & mask_d[None, :], other=0.0)
+    if USE_FP8:
+        ar_tc = ar.to(tl.float8e4nv)
+    else:
+        ar_tc = ar.to(tl.bfloat16)
+
+    # Load cr for query tile
+    cr_base = cr_ptr + stride_cr_e * idx_e + stride_cr_h * idx_h + stride_cr_m * idx_m
+    cr = tl.load(cr_base + stride_cr_b * range_q, mask=mask_q, other=1.0)
+
+    # Online softmax accumulators
+    max_rows = tl.full([TILE_B], float('-inf'), dtype=tl.float32)
+    sum_rows = tl.zeros([TILE_B], dtype=tl.float32)
+    al_acc = tl.zeros([TILE_B, BLOCK_D], dtype=tl.float32)
+    score_acc = tl.zeros([TILE_B], dtype=tl.float32)
+
+    k_base = k_ptr + stride_k_e * idx_e + stride_k_h * idx_h + stride_k_m * idx_m
+    range_k = tl.arange(0, TILE_B)
+
+    for k_start in tl.range(0, B, TILE_B, num_stages=3):
+        k_range = k_start + range_k
+        k_mask = k_range < B
+        if PRE_PAD:
+            k_valid = k_mask & ((block_start_n + k_range) >= pad_offset)
+        else:
+            k_valid = k_mask & ((block_start_n + k_range) < N)
+
+        if HAS_ATTN_MASK:
+            mask_block_offset = (
+                mask_ptr + stride_mask_e * idx_e + stride_mask_m * idx_m
+                + stride_mask_b * (k_range - pad_offset)
+            )
+            valid_token_mask = tl.load(mask_block_offset, mask=k_valid, other=0)
+            k_valid = k_valid & valid_token_mask
+
+        # Load key tile [TILE_B, D]
+        k_offset = stride_k_b * k_range[:, None] + range_d[None, :]
+        k_tile = tl.load(k_base + k_offset, mask=k_mask[:, None] & mask_d[None, :], other=0.0)
+        if USE_FP8:
+            k_tc = k_tile.to(tl.float8e4nv)
+        else:
+            k_tc = k_tile.to(tl.bfloat16)
+
+        # Scores [TILE_B_q, TILE_B_k]
+        scores = sm_scale * tl.dot(ar_tc, tl.trans(k_tc), out_dtype=tl.float32)
+        scores = scores / (cr[:, None] + EPS)
+        scores = scores + tl.where(k_valid[None, :], 0.0, float("-inf"))
+
+        # Online softmax update
+        tile_max = tl.max(scores, axis=1)
+        new_max = tl.maximum(max_rows, tile_max)
+        scale = tl.exp(max_rows - new_max)
+
+        al_acc = al_acc * scale[:, None]
+        sum_rows = sum_rows * scale
+        score_acc = score_acc * scale
+
+        exp_scores = tl.exp(scores - new_max[:, None])
+        if USE_FP8 and TILE_B >= 32:
+            al_acc = al_acc + tl.dot(exp_scores.to(tl.float8e4nv), k_tc, out_dtype=tl.float32)
+        else:
+            al_acc = al_acc + tl.dot(exp_scores.to(tl.bfloat16), k_tile.to(tl.bfloat16) if USE_FP8 else k_tc, out_dtype=tl.float32)
+        score_acc = score_acc + tl.sum(exp_scores * scores, axis=1)
+        sum_rows = sum_rows + tl.sum(exp_scores, axis=1)
+        max_rows = new_max
+
+    # Finalize outputs
+    safe_sum = tl.where(sum_rows > 0, sum_rows, 1.0)
+    al = (sm_scale * al_acc / safe_sum[:, None]).to(ar.dtype)
+    cl = tl.where(sum_rows > 0, score_acc / safe_sum - max_rows - tl.log(safe_sum), 0.0)
+
+    # Store al [TILE_B, D]
+    al_base = al_ptr + stride_al_e * idx_e + stride_al_h * idx_h + stride_al_m * idx_m
+    al_offset = stride_al_b * range_q[:, None] + range_d[None, :]
+    tl.store(al_base + al_offset, al, mask=mask_q[:, None] & mask_d[None, :])
+
+    # Store cl
+    cl_base = cl_ptr + stride_cl_e * idx_e + stride_cl_h * idx_h + stride_cl_m * idx_m
+    tl.store(cl_base + stride_cl_b * range_q, cl, mask=mask_q)
+
+
+@triton.autotune(configs=_get_tiled_b_autotune_configs(), key=['B', 'D'])
+@triton.jit
+def _al_y_cl_kernel_tiled(
+    ar_ptr,
+    stride_ar_e,
+    stride_ar_h,
+    stride_ar_m,
+    stride_ar_b,
+    stride_ar_d,
+    k_ptr,
+    stride_k_e,
+    stride_k_h,
+    stride_k_m,
+    stride_k_b,
+    stride_k_d,
     v_ptr,
     stride_v_e,
     stride_v_h,
@@ -280,7 +444,6 @@ def _al_cl_kernel_tiled(
     BLOCK_D: tl.constexpr,
     PRE_PAD: tl.constexpr,
     EPS: tl.constexpr,
-    COMPUTE_Y: tl.constexpr,
     H: tl.constexpr,
     M: tl.constexpr,
     B: tl.constexpr,
@@ -288,10 +451,10 @@ def _al_cl_kernel_tiled(
     N: tl.constexpr,
     USE_FP8: tl.constexpr = False,
 ):
-    """Tiled version of _al_cl_kernel for large B (>128).
+    """Tiled within-block attention kernel for large B (>128), with y output.
 
-    Uses online softmax to tile over key positions, avoiding B×B attention matrices.
-    When COMPUTE_Y=True, also accumulates y = r @ v.
+    Computes al (attention-weighted keys), cl (log-sum-exp), and y = softmax(q@k^T) @ v.
+    Uses online softmax to tile over key positions, avoiding B×B matrices.
     Grid: (E*H, M, cdiv(B, TILE_B))
     """
     idx_eh = tl.program_id(0)
@@ -310,22 +473,16 @@ def _al_cl_kernel_tiled(
     mask_q = range_q < B
     mask_d = range_d < D
 
-    # Load ar using block pointer [TILE_B, D]
-    ar_block_ptr = tl.make_block_ptr(
-        base=ar_ptr + stride_ar_e * idx_e + stride_ar_h * idx_h + stride_ar_m * idx_m,
-        shape=(B, D),
-        strides=(stride_ar_b, stride_ar_d),
-        offsets=(q_start, 0),
-        block_shape=(TILE_B, BLOCK_D),
-        order=(1, 0),
-    )
-    ar = tl.load(ar_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    # Load ar [TILE_B, D]
+    ar_base = ar_ptr + stride_ar_e * idx_e + stride_ar_h * idx_h + stride_ar_m * idx_m
+    ar_offset = stride_ar_b * range_q[:, None] + range_d[None, :]
+    ar = tl.load(ar_base + ar_offset, mask=mask_q[:, None] & mask_d[None, :], other=0.0)
     if USE_FP8:
         ar_tc = ar.to(tl.float8e4nv)
     else:
         ar_tc = ar.to(tl.bfloat16)
 
-    # Load cr for query tile - 1D, keep manual
+    # Load cr for query tile
     cr_base = cr_ptr + stride_cr_e * idx_e + stride_cr_h * idx_h + stride_cr_m * idx_m
     cr = tl.load(cr_base + stride_cr_b * range_q, mask=mask_q, other=1.0)
 
@@ -333,32 +490,14 @@ def _al_cl_kernel_tiled(
     max_rows = tl.full([TILE_B], float('-inf'), dtype=tl.float32)
     sum_rows = tl.zeros([TILE_B], dtype=tl.float32)
     al_acc = tl.zeros([TILE_B, BLOCK_D], dtype=tl.float32)
-    if COMPUTE_Y:
-        y_acc = tl.zeros([TILE_B, BLOCK_D], dtype=tl.float32)
+    y_acc = tl.zeros([TILE_B, BLOCK_D], dtype=tl.float32)
     score_acc = tl.zeros([TILE_B], dtype=tl.float32)
 
-    # Block pointers for k and v tiles (advanced in loop)
-    k_block_ptr = tl.make_block_ptr(
-        base=k_ptr + stride_k_e * idx_e + stride_k_h * idx_h + stride_k_m * idx_m,
-        shape=(B, D),
-        strides=(stride_k_b, stride_k_d),
-        offsets=(0 - pad_offset, 0),
-        block_shape=(TILE_B, BLOCK_D),
-        order=(1, 0),
-    )
-    if COMPUTE_Y:
-        v_block_ptr = tl.make_block_ptr(
-            base=v_ptr + stride_v_e * idx_e + stride_v_h * idx_h + stride_v_m * idx_m,
-            shape=(B, D),
-            strides=(stride_v_b, stride_v_d),
-            offsets=(0 - pad_offset, 0),
-            block_shape=(TILE_B, BLOCK_D),
-            order=(1, 0),
-        )
+    k_base = k_ptr + stride_k_e * idx_e + stride_k_h * idx_h + stride_k_m * idx_m
+    v_base = v_ptr + stride_v_e * idx_e + stride_v_h * idx_h + stride_v_m * idx_m
     range_k = tl.arange(0, TILE_B)
 
     for k_start in tl.range(0, B, TILE_B, num_stages=3):
-        # Compute validity mask for -inf masking (block ptr handles boundary zeros)
         k_range = k_start + range_k
         k_mask = k_range < B
         if PRE_PAD:
@@ -374,20 +513,21 @@ def _al_cl_kernel_tiled(
             valid_token_mask = tl.load(mask_block_offset, mask=k_valid, other=0)
             k_valid = k_valid & valid_token_mask
 
-        # Load key tile [TILE_B, D] using block pointer
-        k_tile = tl.load(k_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        # Load key tile [TILE_B, D]
+        k_offset = stride_k_b * k_range[:, None] + range_d[None, :]
+        k_tile = tl.load(k_base + k_offset, mask=k_mask[:, None] & mask_d[None, :], other=0.0)
         if USE_FP8:
             k_tc = k_tile.to(tl.float8e4nv)
         else:
             k_tc = k_tile.to(tl.bfloat16)
 
-        if COMPUTE_Y:
-            # Load value tile [TILE_B, D] using block pointer
-            v_tile = tl.load(v_block_ptr, boundary_check=(0, 1), padding_option="zero")
-            if USE_FP8:
-                v_tc = v_tile.to(tl.float8e4nv)
-            else:
-                v_tc = v_tile.to(tl.bfloat16)
+        # Load value tile [TILE_B, D]
+        v_offset = stride_v_b * k_range[:, None] + range_d[None, :]
+        v_tile = tl.load(v_base + v_offset, mask=k_mask[:, None] & mask_d[None, :], other=0.0)
+        if USE_FP8:
+            v_tc = v_tile.to(tl.float8e4nv)
+        else:
+            v_tc = v_tile.to(tl.bfloat16)
 
         # Scores [TILE_B_q, TILE_B_k]
         scores = sm_scale * tl.dot(ar_tc, tl.trans(k_tc), out_dtype=tl.float32)
@@ -400,8 +540,7 @@ def _al_cl_kernel_tiled(
         scale = tl.exp(max_rows - new_max)
 
         al_acc = al_acc * scale[:, None]
-        if COMPUTE_Y:
-            y_acc = y_acc * scale[:, None]
+        y_acc = y_acc * scale[:, None]
         sum_rows = sum_rows * scale
         score_acc = score_acc * scale
 
@@ -410,50 +549,31 @@ def _al_cl_kernel_tiled(
             al_acc = al_acc + tl.dot(exp_scores.to(tl.float8e4nv), k_tc, out_dtype=tl.float32)
         else:
             al_acc = al_acc + tl.dot(exp_scores.to(tl.bfloat16), k_tile.to(tl.bfloat16) if USE_FP8 else k_tc, out_dtype=tl.float32)
-        if COMPUTE_Y:
-            if USE_FP8 and TILE_B >= 32:
-                y_acc = y_acc + tl.dot(exp_scores.to(tl.float8e4nv), v_tc, out_dtype=tl.float32)
-            else:
-                y_acc = y_acc + tl.dot(exp_scores.to(tl.bfloat16), v_tile.to(tl.bfloat16) if USE_FP8 else v_tc, out_dtype=tl.float32)
+        if USE_FP8 and TILE_B >= 32:
+            y_acc = y_acc + tl.dot(exp_scores.to(tl.float8e4nv), v_tc, out_dtype=tl.float32)
+        else:
+            y_acc = y_acc + tl.dot(exp_scores.to(tl.bfloat16), v_tile.to(tl.bfloat16) if USE_FP8 else v_tc, out_dtype=tl.float32)
         score_acc = score_acc + tl.sum(exp_scores * scores, axis=1)
         sum_rows = sum_rows + tl.sum(exp_scores, axis=1)
         max_rows = new_max
-
-        # Advance block pointers to next tile
-        k_block_ptr = tl.advance(k_block_ptr, (TILE_B, 0))
-        if COMPUTE_Y:
-            v_block_ptr = tl.advance(v_block_ptr, (TILE_B, 0))
 
     # Finalize outputs
     safe_sum = tl.where(sum_rows > 0, sum_rows, 1.0)
     al = (sm_scale * al_acc / safe_sum[:, None]).to(ar.dtype)
     cl = tl.where(sum_rows > 0, score_acc / safe_sum - max_rows - tl.log(safe_sum), 0.0)
 
-    # Store al using block pointer
-    al_block_ptr = tl.make_block_ptr(
-        base=al_ptr + stride_al_e * idx_e + stride_al_h * idx_h + stride_al_m * idx_m,
-        shape=(B, D),
-        strides=(stride_al_b, stride_al_d),
-        offsets=(q_start, 0),
-        block_shape=(TILE_B, BLOCK_D),
-        order=(1, 0),
-    )
-    tl.store(al_block_ptr, al, boundary_check=(0, 1))
+    # Store al [TILE_B, D]
+    al_base = al_ptr + stride_al_e * idx_e + stride_al_h * idx_h + stride_al_m * idx_m
+    al_offset = stride_al_b * range_q[:, None] + range_d[None, :]
+    tl.store(al_base + al_offset, al, mask=mask_q[:, None] & mask_d[None, :])
 
-    if COMPUTE_Y:
-        # Store y using block pointer
-        y = (y_acc / safe_sum[:, None]).to(ar.dtype)
-        y_block_ptr = tl.make_block_ptr(
-            base=y_ptr + stride_y_e * idx_e + stride_y_h * idx_h + stride_y_m * idx_m,
-            shape=(B, D),
-            strides=(stride_y_b, stride_y_d),
-            offsets=(q_start, 0),
-            block_shape=(TILE_B, BLOCK_D),
-            order=(1, 0),
-        )
-        tl.store(y_block_ptr, y, boundary_check=(0, 1))
+    # Store y [TILE_B, D]
+    y = (y_acc / safe_sum[:, None]).to(ar.dtype)
+    y_base = y_ptr + stride_y_e * idx_e + stride_y_h * idx_h + stride_y_m * idx_m
+    y_offset = stride_y_b * range_q[:, None] + range_d[None, :]
+    tl.store(y_base + y_offset, y, mask=mask_q[:, None] & mask_d[None, :])
 
-    # Store cl - 1D, keep manual
+    # Store cl
     cl_base = cl_ptr + stride_cl_e * idx_e + stride_cl_h * idx_h + stride_cl_m * idx_m
     tl.store(cl_base + stride_cl_b * range_q, cl, mask=mask_q)
 
@@ -1199,14 +1319,19 @@ def monarch_attention_triton(
     k_strides = (k.stride(0), k.stride(1), B * k.stride(2), k.stride(2), k.stride(3))
     v_strides = (v.stride(0), v.stride(1), B * v.stride(2), v.stride(2), v.stride(3))
 
-    # Pre-copy q into [E,H,M,B,D] layout with zero-padding.
-    # Pre-copy q into ar so kernels always receive [E,H,M,B,D] layout.
-    ar = torch.zeros(E, H, M, B, D, device=q.device, dtype=intermediate_dtype)
-    ar_flat = ar.view(E, H, M * B, D)
-    if pre_pad:
-        ar_flat[:, :, M * B - N:, :] = q.to(intermediate_dtype)
+    # For tiled-B kernels (large B), pre-copy q into [E,H,M,B,D] layout with zero-padding
+    # so block pointer loads work correctly.
+    # For non-tiled kernels, skip pre-copy and use IS_FIRST_CALL to load q directly
+    # (saves ~12μs memcpy overhead at small/medium N).
+    if use_tiled_b_kernels:
+        ar = torch.zeros(E, H, M, B, D, device=q.device, dtype=intermediate_dtype)
+        ar_flat = ar.view(E, H, M * B, D)
+        if pre_pad:
+            ar_flat[:, :, M * B - N:, :] = q.to(intermediate_dtype)
+        else:
+            ar_flat[:, :, :N, :] = q.to(intermediate_dtype)
     else:
-        ar_flat[:, :, :N, :] = q.to(intermediate_dtype)
+        ar = torch.empty(E, H, M, B, D, device=q.device, dtype=intermediate_dtype)
     al = torch.empty_like(ar)
 
     ar_strides = (ar.stride(0), ar.stride(1), ar.stride(2), ar.stride(3), ar.stride(4))
@@ -1260,18 +1385,7 @@ def monarch_attention_triton(
                 Allocates intermediates internally so torch.ones(cr) is captured
                 in the graph and replayed (resetting cr) on each replay.
                 """
-                _ar = torch.zeros(E, H, M, B, D, device=s_q.device, dtype=intermediate_dtype)
-                _ar_flat = _ar.view(E, H, M * B, D)
-                if pre_pad:
-                    if use_fp8 and s_q.dtype != torch.float8_e4m3fn:
-                        _ar_flat[:, :, M * B - N:, :] = s_q.to(intermediate_dtype)
-                    else:
-                        _ar_flat[:, :, M * B - N:, :] = s_q
-                else:
-                    if use_fp8 and s_q.dtype != torch.float8_e4m3fn:
-                        _ar_flat[:, :, :N, :] = s_q.to(intermediate_dtype)
-                    else:
-                        _ar_flat[:, :, :N, :] = s_q
+                _ar = torch.empty(E, H, M, B, D, device=s_q.device, dtype=intermediate_dtype)
                 _al = torch.empty_like(_ar)
                 _cr = torch.ones(E, H, M, B, device=s_q.device, dtype=torch.float)
                 _cl = torch.empty_like(_cr)
@@ -1285,13 +1399,15 @@ def monarch_attention_triton(
                     s_q_fk.copy_(s_q.to(torch.float8_e4m3fn))
 
                 for t in range(T - 1):
+                    _first_ar = s_q_fk if t == 0 else _ar
+                    _first_ar_s = s_qfk_strides if t == 0 else _ar_s
                     _al_cl_kernel[grid_ehm](
-                        _ar, *_ar_s, s_k, *s_k_strides, s_v, *s_v_strides,
+                        _first_ar, *_first_ar_s, s_k, *s_k_strides, s_v, *s_v_strides,
                         _cr, *_cr_s, _al, *_ar_s, _y, *_ar_s, _cl, *_cr_s,
                         s_mask, *s_mask_strides, sm_scale,
                         HAS_ATTN_MASK=s_mask is not None,
                         BLOCK_B=BLOCK_B, BLOCK_D=BLOCK_D, PRE_PAD=pre_pad, EPS=eps,
-                        COMPUTE_Y=False, USE_FP8=use_fp8,
+                        COMPUTE_Y=False, IS_FIRST_CALL=(t == 0), USE_FP8=use_fp8,
                         H=H, M=M, B=B, D=D, N=N,
                         num_warps=num_warps_b, num_stages=num_stages,
                     )
@@ -1311,7 +1427,7 @@ def monarch_attention_triton(
                     s_mask, *s_mask_strides, sm_scale,
                     HAS_ATTN_MASK=s_mask is not None,
                     BLOCK_B=BLOCK_B, BLOCK_D=BLOCK_D, PRE_PAD=pre_pad, EPS=eps,
-                    COMPUTE_Y=True, USE_FP8=use_fp8,
+                    COMPUTE_Y=True, IS_FIRST_CALL=False, USE_FP8=use_fp8,
                     H=H, M=M, B=B, D=D, N=N,
                     num_warps=num_warps_b, num_stages=num_stages,
                 )
@@ -1354,6 +1470,9 @@ def monarch_attention_triton(
     y_strides = (y.stride(0), y.stride(1), y.stride(2), y.stride(3), y.stride(4))
 
     for t in range(T - 1):
+        # On first iteration (t=0), non-tiled kernels read q directly via IS_FIRST_CALL
+        # (avoids pre-copying q into ar). Tiled-B kernels always use pre-copied ar.
+        is_first = (t == 0)
         if use_tiled_b_kernels:
             # Grid uses lambda — TILE_B comes from autotuning
             grid_al_cl_tiled = lambda META: (E * H, M, triton.cdiv(B, META['TILE_B']))
@@ -1362,14 +1481,10 @@ def monarch_attention_triton(
                 *ar_strides,
                 k,
                 *k_strides,
-                v,
-                *v_strides,
                 cr,
                 *cr_strides,
                 al,
                 *al_strides,
-                y,
-                *y_strides,
                 cl,
                 *cl_strides,
                 attn_mask,
@@ -1379,7 +1494,6 @@ def monarch_attention_triton(
                 BLOCK_D=BLOCK_D,  # type: ignore
                 PRE_PAD=pre_pad,  # type: ignore
                 EPS=eps,  # type: ignore
-                COMPUTE_Y=False,  # type: ignore
                 H=H,  # type: ignore
                 M=M,  # type: ignore
                 B=B,  # type: ignore
@@ -1388,9 +1502,12 @@ def monarch_attention_triton(
                 USE_FP8=use_fp8,  # type: ignore
             )
         else:
+            # On first call, pass q_for_kernels with q_strides so kernel loads q directly
+            first_ar = q_for_kernels if is_first else ar
+            first_ar_strides = q_strides if is_first else ar_strides
             _al_cl_kernel[grid_ehm](
-                ar,
-                *ar_strides,
+                first_ar,
+                *first_ar_strides,
                 k,
                 *k_strides,
                 v,
@@ -1412,6 +1529,7 @@ def monarch_attention_triton(
                 PRE_PAD=pre_pad,  # type: ignore
                 EPS=eps,  # type: ignore
                 COMPUTE_Y=False,  # type: ignore
+                IS_FIRST_CALL=is_first,  # type: ignore
                 H=H,  # type: ignore
                 M=M,  # type: ignore
                 B=B,  # type: ignore
@@ -1502,7 +1620,7 @@ def monarch_attention_triton(
     if use_tiled_b_kernels:
         # Grid uses lambda — TILE_B comes from autotuning
         grid_al_y_cl_tiled = lambda META: (E * H, M, triton.cdiv(B, META['TILE_B']))
-        _al_cl_kernel_tiled[grid_al_y_cl_tiled](
+        _al_y_cl_kernel_tiled[grid_al_y_cl_tiled](
             ar,
             *ar_strides,
             k,
@@ -1524,7 +1642,6 @@ def monarch_attention_triton(
             BLOCK_D=BLOCK_D,  # type: ignore
             PRE_PAD=pre_pad,  # type: ignore
             EPS=eps,  # type: ignore
-            COMPUTE_Y=True,  # type: ignore
             H=H,  # type: ignore
             M=M,  # type: ignore
             B=B,  # type: ignore
@@ -1557,6 +1674,7 @@ def monarch_attention_triton(
             PRE_PAD=pre_pad,  # type: ignore
             EPS=eps,  # type: ignore
             COMPUTE_Y=True,  # type: ignore
+            IS_FIRST_CALL=False,  # type: ignore
             H=H,  # type: ignore
             M=M,  # type: ignore
             B=B,  # type: ignore
