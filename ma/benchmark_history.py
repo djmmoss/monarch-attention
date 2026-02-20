@@ -7,17 +7,18 @@ import shutil
 import tempfile
 
 # Commits to benchmark (oldest to newest)
-# Each entry: (label, commit_hash, description, has_fp8)
+# Each entry: (label, commit_hash, description, has_fp8, fixed_B)
+# fixed_B: if set, use this block size instead of optimal_block_size (for pre-optimization commits)
 COMMITS = [
-    ("0: main", "cfe80d1", "Original Triton kernels — no tiling, no block size optimization, B=32 fixed", False),
-    ("1: tiled softmax", "795d699", "Optimized Triton kernels with tiled online softmax (M-tiling) for B200", False),
-    ("2: opt B (cap 128)", "3c04342", "Auto-select optimal block_size (B ≈ √N), capped at B=128", False),
-    ("3: tiled B (no cap)", "27e9da2", "Tiled within-block (B×B) kernels to remove B=128 cap", False),
-    ("4: autotune", "6bc4cd2", "@triton.autotune and software pipelining (num_stages=3) on tiled kernels", False),
-    ("5: warp tuning", "380e683", "Add num_warps=2 to autotune config space for tiled kernels", False),
-    ("6: CUDA graph", "7b63aa4", "CUDA graph capture + refactor (includes 9487175, 5ab250a)", False),
-    ("7: fp8", "9738489", "FP8 tensor cores + CUDA graph for fp8 + expanded autotune configs", True),
-    ("8: block ptrs", "a727008", "Block pointer loads (tl.make_block_ptr) for TMA on Blackwell", True),
+    ("0: main", "cfe80d1", "Original Triton kernels — no tiling, no block size optimization, B=32 fixed", False, 32),
+    ("1: tiled softmax", "795d699", "Optimized Triton kernels with tiled online softmax (M-tiling) for B200", False, 32),
+    ("2: opt B (cap 128)", "3c04342", "Auto-select optimal block_size (B ≈ √N), capped at B=128", False, None),
+    ("3: tiled B (no cap)", "27e9da2", "Tiled within-block (B×B) kernels to remove B=128 cap", False, None),
+    ("4: autotune", "6bc4cd2", "@triton.autotune and software pipelining (num_stages=3) on tiled kernels", False, None),
+    ("5: warp tuning", "380e683", "Add num_warps=2 to autotune config space for tiled kernels", False, None),
+    ("6: CUDA graph", "7b63aa4", "CUDA graph capture + refactor (includes 9487175, 5ab250a)", False, None),
+    ("7: fp8", "9738489", "FP8 tensor cores + CUDA graph for fp8 + expanded autotune configs", True, None),
+    ("8: block ptrs", "a727008", "Block pointer loads (tl.make_block_ptr) for TMA on Blackwell", True, None),
 ]
 
 SEQ_LENGTHS = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576]
@@ -39,10 +40,11 @@ from ma.ma_triton import monarch_attention_triton as ma_triton
 from ma.monarch_attention import optimal_block_size
 
 use_fp8 = {use_fp8}
+fixed_B = {fixed_B}
 seq_lengths = {seq_lengths}
 
 for N in seq_lengths:
-    B = optimal_block_size(N)
+    B = fixed_B if fixed_B else optimal_block_size(N)
     M = triton.cdiv(N, B)
     Q = torch.randn(E, H, N, D, device="cuda", dtype=torch.bfloat16)
     K = torch.randn(E, H, N, D, device="cuda", dtype=torch.bfloat16)
@@ -84,10 +86,11 @@ def parse_bench_output(stdout):
     return results
 
 
-def run_bench_subprocess(repo_root, use_fp8=False):
+def run_bench_subprocess(repo_root, use_fp8=False, fixed_B=None):
     """Run benchmark in a subprocess, return parsed results."""
     script = BENCH_KERNEL.format(
-        repo_root=repo_root, seq_lengths=SEQ_LENGTHS, use_fp8=use_fp8
+        repo_root=repo_root, seq_lengths=SEQ_LENGTHS, use_fp8=use_fp8,
+        fixed_B=fixed_B or "None"
     )
     result = subprocess.run(
         [sys.executable, "-c", script],
@@ -101,7 +104,7 @@ def run_bench_subprocess(repo_root, use_fp8=False):
     return parse_bench_output(result.stdout)
 
 
-def run_benchmark_for_commit(label, commit, has_fp8, repo_root, ma_triton_backup):
+def run_benchmark_for_commit(label, commit, has_fp8, fixed_B, repo_root, ma_triton_backup):
     """Checkout ma_triton.py from commit, run benchmark(s), restore."""
     print(f"\n{'='*60}", file=sys.stderr)
     print(f"Benchmarking: {label} ({commit})", file=sys.stderr)
@@ -128,7 +131,7 @@ def run_benchmark_for_commit(label, commit, has_fp8, repo_root, ma_triton_backup
 
     # Run bf16 benchmark
     print("  Running bf16...", file=sys.stderr)
-    bf16_results = run_bench_subprocess(repo_root, use_fp8=False)
+    bf16_results = run_bench_subprocess(repo_root, use_fp8=False, fixed_B=fixed_B)
     for N in SEQ_LENGTHS:
         val = bf16_results.get(N, "MISSING")
         suffix = f" {val:.3f} ms" if isinstance(val, float) else f" {val}"
@@ -141,7 +144,7 @@ def run_benchmark_for_commit(label, commit, has_fp8, repo_root, ma_triton_backup
         if os.path.exists(triton_cache):
             shutil.rmtree(triton_cache)
         print("  Running fp8...", file=sys.stderr)
-        fp8_results = run_bench_subprocess(repo_root, use_fp8=True)
+        fp8_results = run_bench_subprocess(repo_root, use_fp8=True, fixed_B=fixed_B)
         for N in SEQ_LENGTHS:
             val = fp8_results.get(N, "MISSING")
             suffix = f" {val:.3f} ms" if isinstance(val, float) else f" {val}"
@@ -199,7 +202,7 @@ def build_markdown_table(all_results):
     # Header row
     header = "| N |"
     sep = "|---:|"
-    for label, _, _, _ in COMMITS:
+    for label, *_ in COMMITS:
         header += f" {label} |"
         sep += "---:|"
     lines.append(header)
@@ -209,7 +212,7 @@ def build_markdown_table(all_results):
     for N in SEQ_LENGTHS:
         # Find first valid bf16 result for speedup calculation
         first_valid = None
-        for label, _, _, _ in COMMITS:
+        for label, *_ in COMMITS:
             bf16, _ = all_results.get(label, ({}, None))
             val = bf16.get(N)
             if isinstance(val, float):
@@ -217,7 +220,7 @@ def build_markdown_table(all_results):
                 break
 
         row = f"| {N} |"
-        for label, _, _, _ in COMMITS:
+        for label, *_ in COMMITS:
             bf16, fp8 = all_results.get(label, ({}, None))
             val = bf16.get(N)
             fp8_val = fp8.get(N) if fp8 else None
@@ -234,7 +237,7 @@ def build_markdown_table(all_results):
     lines.append("")
     lines.append("| # | Commit | Description |")
     lines.append("|---|--------|-------------|")
-    for label, commit, desc, _ in COMMITS:
+    for label, commit, desc, *_ in COMMITS:
         num = label.split(":")[0]
         lines.append(f"| {num} | `{commit}` | {desc} |")
     lines.append("")
@@ -261,9 +264,9 @@ def main():
 
     all_results = {}
     try:
-        for label, commit, desc, has_fp8 in COMMITS:
+        for label, commit, desc, has_fp8, fixed_B in COMMITS:
             bf16, fp8 = run_benchmark_for_commit(
-                label, commit, has_fp8, repo_root, backup.name
+                label, commit, has_fp8, fixed_B, repo_root, backup.name
             )
             all_results[label] = (bf16, fp8)
     finally:
