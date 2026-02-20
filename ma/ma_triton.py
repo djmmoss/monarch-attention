@@ -119,6 +119,7 @@ def _al_cl_kernel(
     B: tl.constexpr,
     D: tl.constexpr,
     N: tl.constexpr,
+    USE_FP8: tl.constexpr = False,
 ):
     # 2D grid: (E*H, M) for better workload distribution
     idx_eh = tl.program_id(0)
@@ -174,10 +175,14 @@ def _al_cl_kernel(
     cr_base = cr_ptr + stride_cr_e * idx_e + stride_cr_h * idx_h + stride_cr_m * idx_m
     cr = tl.load(cr_base + stride_cr_b * range_b, mask=mask_b, other=1.0)
 
-    # Attention matrix - use bf16 inputs for tensor cores, fp32 accumulator
-    ar_bf16 = ar.to(tl.bfloat16)
-    k_bf16 = k.to(tl.bfloat16)
-    r = sm_scale * tl.dot(ar_bf16, tl.trans(k_bf16), out_dtype=tl.float32)
+    # Attention matrix - use tensor cores (fp8 or bf16), fp32 accumulator
+    if USE_FP8:
+        ar_tc = ar.to(tl.float8e4nv)
+        k_tc = k.to(tl.float8e4nv)
+    else:
+        ar_tc = ar.to(tl.bfloat16)
+        k_tc = k.to(tl.bfloat16)
+    r = sm_scale * tl.dot(ar_tc, tl.trans(k_tc), out_dtype=tl.float32)
     r = r / (cr[:, None] + EPS)
     r = r + tl.where(k_mask_b[None, :], 0.0, float("-inf"))
     r = tl.exp(r - tl.clamp(tl.max(r, axis=1, keep_dims=True), EPS, float("inf")))
@@ -188,8 +193,13 @@ def _al_cl_kernel(
     cl_base = cl_ptr + stride_cl_e * idx_e + stride_cl_h * idx_h + stride_cl_m * idx_m
     tl.store(cl_base + stride_cl_b * range_b, cl, mask=mask_b)
 
-    # Store al - use bf16 for tensor cores, cast back to input dtype
-    al = (sm_scale * tl.dot(r.to(tl.bfloat16), k_bf16, out_dtype=tl.float32)).to(ar.dtype)
+    # Store al - use tensor cores, cast back to input dtype
+    if USE_FP8 and BLOCK_B >= 32:
+        al = (sm_scale * tl.dot(r.to(tl.float8e4nv), k_tc, out_dtype=tl.float32)).to(ar.dtype)
+    elif USE_FP8:
+        al = (sm_scale * tl.dot(r.to(tl.bfloat16), k.to(tl.bfloat16), out_dtype=tl.float32)).to(ar.dtype)
+    else:
+        al = (sm_scale * tl.dot(r.to(tl.bfloat16), k_tc, out_dtype=tl.float32)).to(ar.dtype)
     al_base = al_ptr + stride_al_e * idx_e + stride_al_h * idx_h + stride_al_m * idx_m
     al_offset = stride_al_b * range_b[:, None] + range_d[None, :]
     tl.store(al_base + al_offset, al, mask=mask_b[:, None] & mask_d[None, :])
@@ -203,8 +213,15 @@ def _al_cl_kernel(
             mask=k_mask_b[:, None] & mask_d[None, :],
             other=0.0,
         )
-        v_bf16 = v.to(tl.bfloat16)
-        y = tl.dot(r.to(tl.bfloat16), v_bf16, out_dtype=tl.float32).to(ar.dtype)
+        if USE_FP8 and BLOCK_B >= 32:
+            v_tc = v.to(tl.float8e4nv)
+            y = tl.dot(r.to(tl.float8e4nv), v_tc, out_dtype=tl.float32).to(ar.dtype)
+        elif USE_FP8:
+            v_bf16 = v.to(tl.bfloat16)
+            y = tl.dot(r.to(tl.bfloat16), v_bf16, out_dtype=tl.float32).to(ar.dtype)
+        else:
+            v_bf16 = v.to(tl.bfloat16)
+            y = tl.dot(r.to(tl.bfloat16), v_bf16, out_dtype=tl.float32).to(ar.dtype)
         y_base = y_ptr + stride_y_e * idx_e + stride_y_h * idx_h + stride_y_m * idx_m
         y_offset = stride_y_b * range_b[:, None] + range_d[None, :]
         tl.store(y_base + y_offset, y, mask=mask_b[:, None] & mask_d[None, :])
@@ -269,6 +286,7 @@ def _al_cl_kernel_tiled(
     B: tl.constexpr,
     D: tl.constexpr,
     N: tl.constexpr,
+    USE_FP8: tl.constexpr = False,
 ):
     """Tiled version of _al_cl_kernel for large B (>128).
 
@@ -296,7 +314,10 @@ def _al_cl_kernel_tiled(
     ar_base = ar_ptr + stride_ar_e * idx_e + stride_ar_h * idx_h + stride_ar_m * idx_m
     ar_offset = stride_ar_b * range_q[:, None] + range_d[None, :]
     ar = tl.load(ar_base + ar_offset, mask=mask_q[:, None] & mask_d[None, :], other=0.0)
-    ar_bf16 = ar.to(tl.bfloat16)
+    if USE_FP8:
+        ar_tc = ar.to(tl.float8e4nv)
+    else:
+        ar_tc = ar.to(tl.bfloat16)
 
     # Load cr for query tile
     cr_base = cr_ptr + stride_cr_e * idx_e + stride_cr_h * idx_h + stride_cr_m * idx_m
@@ -335,16 +356,22 @@ def _al_cl_kernel_tiled(
         # Load key tile [TILE_B, D]
         k_offset = stride_k_b * (k_range - pad_offset)[:, None] + range_d[None, :]
         k_tile = tl.load(k_base + k_offset, mask=k_valid[:, None] & mask_d[None, :], other=0.0)
-        k_bf16 = k_tile.to(tl.bfloat16)
+        if USE_FP8:
+            k_tc = k_tile.to(tl.float8e4nv)
+        else:
+            k_tc = k_tile.to(tl.bfloat16)
 
         if COMPUTE_Y:
             # Load value tile [TILE_B, D]
             v_offset = stride_v_b * (k_range - pad_offset)[:, None] + range_d[None, :]
             v_tile = tl.load(v_base + v_offset, mask=k_valid[:, None] & mask_d[None, :], other=0.0)
-            v_bf16 = v_tile.to(tl.bfloat16)
+            if USE_FP8:
+                v_tc = v_tile.to(tl.float8e4nv)
+            else:
+                v_tc = v_tile.to(tl.bfloat16)
 
         # Scores [TILE_B_q, TILE_B_k]
-        scores = sm_scale * tl.dot(ar_bf16, tl.trans(k_bf16), out_dtype=tl.float32)
+        scores = sm_scale * tl.dot(ar_tc, tl.trans(k_tc), out_dtype=tl.float32)
         scores = scores / (cr[:, None] + EPS)
         scores = scores + tl.where(k_valid[None, :], 0.0, float("-inf"))
 
@@ -360,9 +387,15 @@ def _al_cl_kernel_tiled(
         score_acc = score_acc * scale
 
         exp_scores = tl.exp(scores - new_max[:, None])
-        al_acc = al_acc + tl.dot(exp_scores.to(tl.bfloat16), k_bf16, out_dtype=tl.float32)
+        if USE_FP8 and TILE_B >= 32:
+            al_acc = al_acc + tl.dot(exp_scores.to(tl.float8e4nv), k_tc, out_dtype=tl.float32)
+        else:
+            al_acc = al_acc + tl.dot(exp_scores.to(tl.bfloat16), k_tile.to(tl.bfloat16) if USE_FP8 else k_tc, out_dtype=tl.float32)
         if COMPUTE_Y:
-            y_acc = y_acc + tl.dot(exp_scores.to(tl.bfloat16), v_bf16, out_dtype=tl.float32)
+            if USE_FP8 and TILE_B >= 32:
+                y_acc = y_acc + tl.dot(exp_scores.to(tl.float8e4nv), v_tc, out_dtype=tl.float32)
+            else:
+                y_acc = y_acc + tl.dot(exp_scores.to(tl.bfloat16), v_tile.to(tl.bfloat16) if USE_FP8 else v_tc, out_dtype=tl.float32)
         score_acc = score_acc + tl.sum(exp_scores * scores, axis=1)
         sum_rows = sum_rows + tl.sum(exp_scores, axis=1)
         max_rows = new_max
@@ -432,6 +465,7 @@ def _ar_cr_kernel(
     B: tl.constexpr,
     D: tl.constexpr,
     N: tl.constexpr,
+    USE_FP8: tl.constexpr = False,
 ):
     # 2D grid: (E*H, B) for better workload distribution
     idx_eh = tl.program_id(0)
@@ -487,10 +521,14 @@ def _ar_cr_kernel(
     cl_base = cl_ptr + stride_cl_e * idx_e + stride_cl_h * idx_h + stride_cl_b * idx_b
     cl = tl.load(cl_base + stride_cl_m * range_m, mask=mask_m, other=0.0)
 
-    # Attention matrix - use bf16 inputs for tensor cores, fp32 accumulator
-    al_bf16 = al.to(tl.bfloat16)
-    q_bf16 = q.to(tl.bfloat16)
-    l = tl.dot(al_bf16, tl.trans(q_bf16), out_dtype=tl.float32)
+    # Attention matrix - use tensor cores (fp8 or bf16), fp32 accumulator
+    if USE_FP8:
+        al_tc = al.to(tl.float8e4nv)
+        q_tc = q.to(tl.float8e4nv)
+    else:
+        al_tc = al.to(tl.bfloat16)
+        q_tc = q.to(tl.bfloat16)
+    l = tl.dot(al_tc, tl.trans(q_tc), out_dtype=tl.float32)
     l = l - cl[:, None]
     l = l + tl.where(mask_m[:, None], 0.0, float("-inf"))
     l = tl.exp(l - tl.max(l, axis=0, keep_dims=True))
@@ -502,8 +540,13 @@ def _ar_cr_kernel(
     cr_base = cr_ptr + stride_cr_e * idx_e + stride_cr_h * idx_h + stride_cr_b * idx_b
     tl.store(cr_base + stride_cr_m * range_m, cr, mask=mask_m)
 
-    # Store ar - use bf16 for tensor cores, cast back to input dtype
-    ar = tl.dot(l.to(tl.bfloat16), q_bf16, out_dtype=tl.float32).to(al.dtype)
+    # Store ar - use tensor cores, cast back to input dtype
+    if USE_FP8 and BLOCK_M >= 32:
+        ar = tl.dot(l.to(tl.float8e4nv), q_tc, out_dtype=tl.float32).to(al.dtype)
+    elif USE_FP8:
+        ar = tl.dot(l.to(tl.bfloat16), q.to(tl.bfloat16), out_dtype=tl.float32).to(al.dtype)
+    else:
+        ar = tl.dot(l.to(tl.bfloat16), q_tc, out_dtype=tl.float32).to(al.dtype)
     ar_base = ar_ptr + stride_ar_e * idx_e + stride_ar_h * idx_h + stride_ar_b * idx_b
     ar_offset = stride_ar_m * range_m[:, None] + range_d[None, :]
     tl.store(ar_base + ar_offset, ar, mask=mask_m[:, None] & mask_d[None, :])
@@ -550,6 +593,7 @@ def _z_kernel(
     B: tl.constexpr,
     D: tl.constexpr,
     N: tl.constexpr,
+    USE_FP8: tl.constexpr = False,
 ):
     # 2D grid: (E*H, B) for better workload distribution
     idx_eh = tl.program_id(0)
@@ -589,10 +633,14 @@ def _z_kernel(
     # Load cl
     cl = tl.load(cl_base + stride_cl_m * range_m, mask=mask_m, other=0.0)
 
-    # Attention matrix - use bf16 inputs for tensor cores, fp32 accumulator
-    q_bf16 = q.to(tl.bfloat16)
-    al_bf16 = al.to(tl.bfloat16)
-    l = tl.dot(q_bf16, tl.trans(al_bf16), out_dtype=tl.float32)
+    # Attention matrix - use tensor cores (fp8 or bf16), fp32 accumulator
+    if USE_FP8:
+        q_tc = q.to(tl.float8e4nv)
+        al_tc = al.to(tl.float8e4nv)
+    else:
+        q_tc = q.to(tl.bfloat16)
+        al_tc = al.to(tl.bfloat16)
+    l = tl.dot(q_tc, tl.trans(al_tc), out_dtype=tl.float32)
     l = l - cl[None, :]
     l = l + tl.where(mask_m[None, :], 0.0, float("-inf"))
     l = tl.exp(l - tl.max(l, axis=1, keep_dims=True))
@@ -603,12 +651,20 @@ def _z_kernel(
     y_offset = stride_y_m * range_m[:, None] + stride_y_d * range_d[None, :]
     y = tl.load(y_base + y_offset, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
 
-    # Store z - use bf16 for tensor cores, cast back to input dtype
-    y_bf16 = y.to(tl.bfloat16)
-    z = tl.dot(l.to(tl.bfloat16), y_bf16, out_dtype=tl.float32).to(al.dtype)
+    # Store z - use tensor cores, cast to bf16 output
+    if USE_FP8 and BLOCK_M >= 32:
+        y_tc = y.to(tl.float8e4nv)
+        z = tl.dot(l.to(tl.float8e4nv), y_tc, out_dtype=tl.float32)
+    elif USE_FP8:
+        y_bf16 = y.to(tl.bfloat16)
+        z = tl.dot(l.to(tl.bfloat16), y_bf16, out_dtype=tl.float32)
+    else:
+        y_bf16 = y.to(tl.bfloat16)
+        z = tl.dot(l.to(tl.bfloat16), y_bf16, out_dtype=tl.float32)
+    z_out = z.to(tl.bfloat16) if USE_FP8 else z.to(al.dtype)
     z_base = z_ptr + stride_z_e * idx_e + stride_z_h * idx_h + stride_z_b * (idx_b - pad_offset)
     z_offset = stride_z_m * range_m[:, None] + stride_z_d * range_d[None, :]
-    tl.store(z_base + z_offset, z, mask=q_mask_m[:, None] & mask_d[None, :])
+    tl.store(z_base + z_offset, z_out, mask=q_mask_m[:, None] & mask_d[None, :])
 
 
 # =============================================================================
@@ -627,6 +683,7 @@ def _ar_cr_softmax_stats_kernel(
     sum_ptr, stride_sum_e, stride_sum_h, stride_sum_m, stride_sum_b,
     TILE_M: tl.constexpr, BLOCK_D: tl.constexpr, PRE_PAD: tl.constexpr,
     H: tl.constexpr, M: tl.constexpr, B: tl.constexpr, D: tl.constexpr, N: tl.constexpr,
+    USE_FP8: tl.constexpr = False,
 ):
     """Phase 1: Compute softmax max and sum for each column j.
 
@@ -664,7 +721,10 @@ def _ar_cr_softmax_stats_kernel(
     # Load q_tile [TILE_M, D] - the "key" positions for this column tile
     q_offset = stride_q_m * j_range[:, None] + stride_q_d * range_d[None, :]
     q_tile = tl.load(q_base + q_offset, mask=q_mask_j[:, None] & mask_d[None, :], other=0.0)
-    q_bf16 = q_tile.to(tl.bfloat16)
+    if USE_FP8:
+        q_tc = q_tile.to(tl.float8e4nv)
+    else:
+        q_tc = q_tile.to(tl.bfloat16)
 
     # Initialize online softmax accumulators for each column
     max_cols = tl.full([TILE_M], float('-inf'), dtype=tl.float32)
@@ -684,8 +744,11 @@ def _ar_cr_softmax_stats_kernel(
         cl_tile = tl.load(cl_base + stride_cl_m * i_range, mask=i_mask, other=0.0)
 
         # Compute attention scores [TILE_M_i, TILE_M_j]
-        al_bf16 = al_tile.to(tl.bfloat16)
-        scores = tl.dot(al_bf16, tl.trans(q_bf16), out_dtype=tl.float32)  # [TILE_M, TILE_M]
+        if USE_FP8:
+            al_tc = al_tile.to(tl.float8e4nv)
+        else:
+            al_tc = al_tile.to(tl.bfloat16)
+        scores = tl.dot(al_tc, tl.trans(q_tc), out_dtype=tl.float32)  # [TILE_M, TILE_M]
         scores = scores - cl_tile[:, None]
         scores = tl.where(i_mask[:, None], scores, float('-inf'))
 
@@ -726,6 +789,7 @@ def _ar_cr_accumulate_kernel(
     cr_ptr, stride_cr_e, stride_cr_h, stride_cr_m, stride_cr_b,
     TILE_M: tl.constexpr, BLOCK_D: tl.constexpr, PRE_PAD: tl.constexpr,
     H: tl.constexpr, M: tl.constexpr, B: tl.constexpr, D: tl.constexpr, N: tl.constexpr,
+    USE_FP8: tl.constexpr = False,
 ):
     """Phase 2: Compute ar and cr using precomputed softmax stats.
 
@@ -757,7 +821,10 @@ def _ar_cr_accumulate_kernel(
     # Load al_tile [TILE_M, D] - this tile's rows
     al_offset = stride_al_m * i_range[:, None] + stride_al_d * range_d[None, :]
     al_tile = tl.load(al_base + al_offset, mask=i_mask[:, None] & mask_d[None, :], other=0.0)
-    al_bf16 = al_tile.to(tl.bfloat16)
+    if USE_FP8:
+        al_tc = al_tile.to(tl.float8e4nv)
+    else:
+        al_tc = al_tile.to(tl.bfloat16)
 
     # Load cl_tile [TILE_M]
     cl_tile = tl.load(cl_base + stride_cl_m * i_range, mask=i_mask, other=0.0)
@@ -780,14 +847,17 @@ def _ar_cr_accumulate_kernel(
         # Load q_tile [TILE_M, D]
         q_offset = stride_q_m * j_range[:, None] + stride_q_d * range_d[None, :]
         q_tile = tl.load(q_base + q_offset, mask=q_mask_j[:, None] & mask_d[None, :], other=0.0)
-        q_bf16 = q_tile.to(tl.bfloat16)
+        if USE_FP8:
+            q_tc = q_tile.to(tl.float8e4nv)
+        else:
+            q_tc = q_tile.to(tl.bfloat16)
 
         # Load precomputed max and sum for these columns
         max_cols = tl.load(max_base + stride_max_m * j_range, mask=j_mask, other=0.0)
         sum_cols = tl.load(sum_base + stride_sum_m * j_range, mask=j_mask, other=1.0)  # Avoid div by zero
 
         # Compute attention scores [TILE_M, TILE_M]
-        scores = tl.dot(al_bf16, tl.trans(q_bf16), out_dtype=tl.float32)
+        scores = tl.dot(al_tc, tl.trans(q_tc), out_dtype=tl.float32)
         scores = scores - cl_tile[:, None]
 
         # Compute normalized attention weights
@@ -796,7 +866,12 @@ def _ar_cr_accumulate_kernel(
         l_tile = tl.where(q_mask_j[None, :], l_tile, 0.0)
 
         # Accumulate ar and cr
-        ar_acc = ar_acc + tl.dot(l_tile.to(tl.bfloat16), q_bf16, out_dtype=tl.float32)
+        if USE_FP8 and TILE_M >= 32:
+            ar_acc = ar_acc + tl.dot(l_tile.to(tl.float8e4nv), q_tc, out_dtype=tl.float32)
+        elif USE_FP8:
+            ar_acc = ar_acc + tl.dot(l_tile.to(tl.bfloat16), q_tile.to(tl.bfloat16), out_dtype=tl.float32)
+        else:
+            ar_acc = ar_acc + tl.dot(l_tile.to(tl.bfloat16), q_tc, out_dtype=tl.float32)
         cr_acc = cr_acc + tl.sum(l_tile, axis=1)
 
     # Store results
@@ -820,6 +895,7 @@ def _z_kernel_tiled(
     z_ptr, stride_z_e, stride_z_h, stride_z_m, stride_z_b, stride_z_d,
     TILE_M: tl.constexpr, BLOCK_D: tl.constexpr, PRE_PAD: tl.constexpr,
     H: tl.constexpr, M: tl.constexpr, B: tl.constexpr, D: tl.constexpr, N: tl.constexpr,
+    USE_FP8: tl.constexpr = False,
 ):
     """Tiled _z_kernel using Flash Attention style online softmax.
 
@@ -882,9 +958,13 @@ def _z_kernel_tiled(
         y_tile = tl.load(y_base + y_offset, mask=j_mask[:, None] & mask_d[None, :], other=0.0)
 
         # Compute attention scores [TILE_M_i, TILE_M_j]
-        q_bf16 = q_tile.to(tl.bfloat16)
-        al_bf16 = al_tile.to(tl.bfloat16)
-        scores = tl.dot(q_bf16, tl.trans(al_bf16), out_dtype=tl.float32)  # [TILE_M, TILE_M]
+        if USE_FP8:
+            q_tc = q_tile.to(tl.float8e4nv)
+            al_tc = al_tile.to(tl.float8e4nv)
+        else:
+            q_tc = q_tile.to(tl.bfloat16)
+            al_tc = al_tile.to(tl.bfloat16)
+        scores = tl.dot(q_tc, tl.trans(al_tc), out_dtype=tl.float32)  # [TILE_M, TILE_M]
         scores = scores - cl_tile[None, :]
         scores = tl.where(j_mask[None, :], scores, float('-inf'))
 
@@ -901,8 +981,12 @@ def _z_kernel_tiled(
         exp_scores = tl.exp(scores - new_max[:, None])
 
         # Accumulate weighted values
-        y_bf16 = y_tile.to(tl.bfloat16)
-        z_acc = z_acc + tl.dot(exp_scores.to(tl.bfloat16), y_bf16, out_dtype=tl.float32)
+        if USE_FP8 and TILE_M >= 32:
+            y_tc = y_tile.to(tl.float8e4nv)
+            z_acc = z_acc + tl.dot(exp_scores.to(tl.float8e4nv), y_tc, out_dtype=tl.float32)
+        else:
+            y_bf16 = y_tile.to(tl.bfloat16)
+            z_acc = z_acc + tl.dot(exp_scores.to(tl.bfloat16), y_bf16, out_dtype=tl.float32)
         sum_rows = sum_rows + tl.sum(exp_scores, axis=1)
 
         max_rows = new_max
@@ -913,7 +997,8 @@ def _z_kernel_tiled(
     # Store z
     z_base = z_ptr + stride_z_e * idx_e + stride_z_h * idx_h + stride_z_b * (idx_b - pad_offset)
     z_offset = stride_z_m * i_range[:, None] + stride_z_d * range_d[None, :]
-    tl.store(z_base + z_offset, z.to(q_tile.dtype), mask=q_mask_i[:, None] & mask_d[None, :])
+    z_out = z.to(tl.bfloat16) if USE_FP8 else z.to(q_tile.dtype)
+    tl.store(z_base + z_offset, z_out, mask=q_mask_i[:, None] & mask_d[None, :])
 
 
 
@@ -967,6 +1052,14 @@ def monarch_attention_triton(
     if not v.is_contiguous():
         v = v.contiguous()
 
+    # Detect fp8 mode from input dtypes
+    use_fp8 = k.dtype == torch.float8_e4m3fn
+    if use_fp8:
+        assert v.dtype == torch.float8_e4m3fn, "k and v must have same dtype"
+        intermediate_dtype = torch.float8_e4m3fn
+    else:
+        intermediate_dtype = q.dtype
+
     E, H, N, D = q.shape
     M = triton.cdiv(N, B)
 
@@ -1000,18 +1093,20 @@ def monarch_attention_triton(
 
     sm_scale = 1 / sqrt(D)
 
-    q_strides = (q.stride(0), q.stride(1), B * q.stride(2), q.stride(2), q.stride(3))
+    # For fp8 mode, pre-convert q for kernels that do dot products with it
+    q_for_kernels = q.to(torch.float8_e4m3fn) if use_fp8 and q.dtype != torch.float8_e4m3fn else q
+    q_strides = (q_for_kernels.stride(0), q_for_kernels.stride(1), B * q_for_kernels.stride(2), q_for_kernels.stride(2), q_for_kernels.stride(3))
     k_strides = (k.stride(0), k.stride(1), B * k.stride(2), k.stride(2), k.stride(3))
     v_strides = (v.stride(0), v.stride(1), B * v.stride(2), v.stride(2), v.stride(3))
 
     # Pre-copy q into [E,H,M,B,D] layout with zero-padding.
     # Pre-copy q into ar so kernels always receive [E,H,M,B,D] layout.
-    ar = torch.zeros(E, H, M, B, D, device=q.device, dtype=q.dtype)
+    ar = torch.zeros(E, H, M, B, D, device=q.device, dtype=intermediate_dtype)
     ar_flat = ar.view(E, H, M * B, D)
     if pre_pad:
-        ar_flat[:, :, M * B - N:, :] = q
+        ar_flat[:, :, M * B - N:, :] = q.to(intermediate_dtype)
     else:
-        ar_flat[:, :, :N, :] = q
+        ar_flat[:, :, :N, :] = q.to(intermediate_dtype)
     al = torch.empty_like(ar)
 
     ar_strides = (ar.stride(0), ar.stride(1), ar.stride(2), ar.stride(3), ar.stride(4))
@@ -1036,7 +1131,7 @@ def monarch_attention_triton(
     # For N <= 4096: tensor copies ~2-8μs, graph saves ~15-35μs = net win (up to 2.4x)
     # For N > 4096: tensor copy cost grows linearly and outweighs launch overhead savings
     MAX_CUDA_GRAPH_N = 4096
-    use_cuda_graph = not use_tiled_kernels and not use_tiled_b_kernels and N <= MAX_CUDA_GRAPH_N
+    use_cuda_graph = not use_tiled_kernels and not use_tiled_b_kernels and N <= MAX_CUDA_GRAPH_N and not use_fp8
     if use_cuda_graph:
         cache_key = (E, H, N, D, B, T, pre_pad, attn_mask is not None, q.dtype, eps)
         if cache_key not in _cuda_graph_cache:
@@ -1174,6 +1269,7 @@ def monarch_attention_triton(
                 B=B,  # type: ignore
                 D=D,  # type: ignore
                 N=N,  # type: ignore
+                USE_FP8=use_fp8,  # type: ignore
             )
         else:
             _al_cl_kernel[grid_ehm](
@@ -1205,6 +1301,7 @@ def monarch_attention_triton(
                 B=B,  # type: ignore
                 D=D,  # type: ignore
                 N=N,  # type: ignore
+                USE_FP8=use_fp8,  # type: ignore
                 num_warps=num_warps_b,
                 num_stages=num_stages,
             )
@@ -1224,7 +1321,7 @@ def monarch_attention_triton(
             # Phase 1: Compute softmax stats
             _ar_cr_softmax_stats_kernel[grid_tiled](
                 al, *al_strides,
-                q, *q_strides,
+                q_for_kernels, *q_strides,
                 cl, *cl_strides,
                 softmax_max, *max_strides,
                 softmax_sum, *sum_strides,
@@ -1236,12 +1333,13 @@ def monarch_attention_triton(
                 B=B,  # type: ignore
                 D=D,  # type: ignore
                 N=N,  # type: ignore
+                USE_FP8=use_fp8,  # type: ignore
             )
 
             # Phase 2: Accumulate ar and cr
             _ar_cr_accumulate_kernel[grid_tiled](
                 al, *al_strides,
-                q, *q_strides,
+                q_for_kernels, *q_strides,
                 cl, *cl_strides,
                 softmax_max, *max_strides,
                 softmax_sum, *sum_strides,
@@ -1255,12 +1353,13 @@ def monarch_attention_triton(
                 B=B,  # type: ignore
                 D=D,  # type: ignore
                 N=N,  # type: ignore
+                USE_FP8=use_fp8,  # type: ignore
             )
         else:
             _ar_cr_kernel[grid_ehb](
                 al,
                 *al_strides,
-                q,
+                q_for_kernels,
                 *q_strides,
                 cl,
                 *cl_strides,
@@ -1279,6 +1378,7 @@ def monarch_attention_triton(
                 B=B,  # type: ignore
                 D=D,  # type: ignore
                 N=N,  # type: ignore
+                USE_FP8=use_fp8,  # type: ignore
                 num_warps=num_warps_m,
                 num_stages=num_stages,
             )
@@ -1314,6 +1414,7 @@ def monarch_attention_triton(
             B=B,  # type: ignore
             D=D,  # type: ignore
             N=N,  # type: ignore
+            USE_FP8=use_fp8,  # type: ignore
         )
     else:
         _al_cl_kernel[grid_ehm](
@@ -1345,11 +1446,13 @@ def monarch_attention_triton(
             B=B,  # type: ignore
             D=D,  # type: ignore
             N=N,  # type: ignore
+            USE_FP8=use_fp8,  # type: ignore
             num_warps=num_warps_b,
             num_stages=num_stages,
         )
 
-    z = torch.empty_like(v)
+    # Output z is always bf16 (fp8 inputs produce bf16 output; bf16 inputs stay bf16)
+    z = torch.empty(E, H, N, D, device=q.device, dtype=torch.bfloat16 if use_fp8 else q.dtype)
     z_strides = (z.stride(0), z.stride(1), B * z.stride(2), z.stride(2), z.stride(3))
 
     if use_tiled_kernels:
@@ -1357,7 +1460,7 @@ def monarch_attention_triton(
         grid_z_tiled = lambda META: (E * H, B, triton.cdiv(M, META['TILE_M']))
         _z_kernel_tiled[grid_z_tiled](
             al, *al_strides,
-            q, *q_strides,
+            q_for_kernels, *q_strides,
             y, *y_strides,
             cl, *cl_strides,
             z, *z_strides,
@@ -1368,12 +1471,13 @@ def monarch_attention_triton(
             B=B,  # type: ignore
             D=D,  # type: ignore
             N=N,  # type: ignore
+            USE_FP8=use_fp8,  # type: ignore
         )
     else:
         _z_kernel[grid_ehb](
             al,
             *al_strides,
-            q,
+            q_for_kernels,
             *q_strides,
             y,
             *y_strides,
@@ -1389,6 +1493,7 @@ def monarch_attention_triton(
             B=B,  # type: ignore
             D=D,  # type: ignore
             N=N,  # type: ignore
+            USE_FP8=use_fp8,  # type: ignore
             num_warps=num_warps_m,
             num_stages=num_stages,
         )
